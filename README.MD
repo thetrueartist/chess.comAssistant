@@ -1,1 +1,3 @@
-For use with Chess.com
+Tortch-vision + Stockfish,
+
+for use with Chess.com
