@@ -55,7 +55,7 @@ psutil
 ```bash
 pip install opencv-python numpy pyscreenshot torch torchvision python-chess psutil pillow
 
-*(you might need to use --break-system-packages on newer versions of linux for that pip command)*
+(you might need to use --break-system-packages on newer versions of linux for that pip command)
 
 sudo apt-get install stockfish  # Debian/Ubuntu
 brew install stockfish          # MacOS
