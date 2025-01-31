@@ -3,20 +3,25 @@
 **A smart chess bot that combines computer vision and AI to play chess in real-time on Chess.com**
 
 ## Features ✨
-- 🖥️ **Screen Analysis**: Automatically detects chessboard position using OpenCV
-- 🤖 **AI Integration**: Powered by Stockfish engine with dynamic difficulty adjustment (0-20 skill levels)
+- 🖥️ **Screen Analysis**: Automatically detects chessboard position using OpenCV + PyTorch Vision
+
+- 🤖 **ML Chess Engine Integration With Stockfish**: Powered by Stockfish engine with dynamic difficulty adjustment (0-20 skill levels)
+
 - 🕵️ **Anti-Detection System**: 
   - Randomized move timing patterns
   - Human-like move selection variance
   - Dynamic skill adjustment
+
 - 🧠 **Smart Game Analysis**:
   - Real-time FEN position recognition
   - Automatic game phase detection (opening/middlegame/endgame)
   - Adaptive thinking time based on position complexity
+
 - 📊 **Performance Monitoring**:
   - CPU/Memory usage tracking
   - Detailed error logging
   - Move validation system
+
 - ♟️ **Game Features**:
   - Supports both white and black pieces
   - Win condition detection
