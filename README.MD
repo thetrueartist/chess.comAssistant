@@ -71,6 +71,9 @@ brew install stockfish          # MacOS
 
 **Chess.com Assistant is ideally uses with the terminal on the right half of your screen and the chess.com window on the left hand side. It additionally only works on the default Chess.com theme.**
 
+**Additionally it works best at 1440p resolution.**
+https://github.com/thetrueartist/chess.comAssistant/blob/main/chessAssistant.png
+
 <h1> LINUX ONLY </h1> *(for now)*
 
 
