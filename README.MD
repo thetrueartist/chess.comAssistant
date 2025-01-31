@@ -51,4 +51,5 @@ pyscreenshot
 python-chess
 psutil
 
+'''bash
 *WORK IN PROGRESS, A LITTLE BUGGY :p*
