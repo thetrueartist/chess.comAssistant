@@ -1,6 +1,6 @@
 # ChessVisionBot ♟️👁️🤖
 
-**A smart chess bot that combines computer vision and AI to play chess in real-time on Chess.com
+**A smart chess bot that combines computer vision and AI to play chess in real-time on Chess.com**
 
 ## Features ✨
 - 🖥️ **Screen Analysis**: Automatically detects chessboard position using OpenCV
