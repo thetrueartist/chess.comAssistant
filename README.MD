@@ -55,7 +55,7 @@ opencv-python
 pyscreenshot
 python-chess
 psutil
-
+```
 ## Installation 🛠️
 ```bash
 pip install opencv-python numpy pyscreenshot torch torchvision python-chess psutil pillow
