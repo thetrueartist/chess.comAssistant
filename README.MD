@@ -68,7 +68,8 @@ brew install stockfish          # MacOS
 
 ## NOTES 🗒️
 
-<h3> LINUX ONLY </h3> *(for now)*
+<h3> LINUX ONLY </h3> 
+<h4> *(for now)* </h4>
 
 **Chess.com Assistant is ideally used with the terminal on the right half of your screen and the chess.com window on the left hand side. It additionally only works on the default Chess.com theme.**
 
