@@ -66,6 +66,11 @@ sudo apt-get install stockfish  # Debian/Ubuntu
 brew install stockfish          # MacOS
 ```
 
+Or for Windows download the latest version of stockfish here:
+https://stockfishchess.org/download/
+
+(I may add in auto downloading of stockfish on windows at some point)
+
 ## NOTES 🗒️
 
 <h3> NOW WITH WINDOWS SUPPORT! </h3> 
