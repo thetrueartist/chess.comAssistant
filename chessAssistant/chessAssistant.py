@@ -15,6 +15,8 @@ import psutil
 import queue
 import logging
 import random
+import platform
+import tempfile
 
 # Configure logging
 logging.basicConfig(
@@ -98,14 +100,104 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def initialize_stockfish():
-    stockfish_path = (
-        "/usr/games/stockfish"  # Update this path to where Stockfish is located
-    )
-    if not os.path.exists(stockfish_path):
-        raise FileNotFoundError(f"Stockfish not found at {stockfish_path}")
-    engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-    engine.configure({"Threads": threads, "Hash": hash_size})
-    return engine
+    # Get threads and hash_size from global scope or define them here
+    threads = 4  # Default value, replace with your global variable
+    hash_size = 256  # Default value, replace with your global variable
+    
+    def find_stockfish_exe():
+        """Find the Stockfish executable using a focused approach"""
+        # Common drive letters to check on Windows
+        drive_letters = ['C:', 'D:', 'E:']
+        common_folders = ['Downloads', 'Program Files', 'Program Files (x86)', 'Users']
+        
+        # First check the exact path we know about
+        exact_path = 'D:\\Downloads\\stockfish-windows-x86-64-avx2\\stockfish\\stockfish-windows-x86-64-avx2.exe'
+        if os.path.exists(exact_path) and os.path.isfile(exact_path):
+            return exact_path
+            
+        # Look for the stockfish-windows-x86-64-avx2\stockfish folder
+        for drive in drive_letters:
+            for folder in common_folders:
+                # Skip non-existent combinations
+                base_path = f"{drive}\\{folder}"
+                if not os.path.exists(base_path):
+                    continue
+                    
+                try:
+                    # Search for the specific folder pattern
+                    for root, dirs, files in os.walk(base_path):
+                        # Check if we're in a stockfish folder
+                        if "stockfish-windows-x86-64-avx2" in root and root.endswith("stockfish"):
+                            # Use the first .exe file we find
+                            for file in files:
+                                if file.endswith('.exe'):
+                                    return os.path.join(root, file)
+                            
+                        # Also check if the current path contains stockfish
+                        if "stockfish" in root.lower():
+                            for file in files:
+                                if file.endswith('.exe') and 'stockfish' in file.lower():
+                                    return os.path.join(root, file)
+                except (PermissionError, FileNotFoundError):
+                    # Skip if we can't access this location
+                    continue
+        
+        # Fallback to standard locations
+        if platform.system() == 'Windows':
+            standard_paths = [
+                os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), 'Stockfish', 'stockfish.exe'),
+                os.path.join(os.path.expanduser('~'), 'Downloads', 'stockfish.exe'),
+                'stockfish.exe'
+            ]
+        else:  # Linux/Mac
+            standard_paths = [
+                '/usr/games/stockfish',
+                '/usr/local/bin/stockfish',
+                '/usr/bin/stockfish',
+                'stockfish'
+            ]
+            
+        for path in standard_paths:
+            if os.path.exists(path) and os.path.isfile(path):
+                return path
+                
+        return None
+    
+    # Try to find Stockfish executable
+    stockfish_path = find_stockfish_exe()
+    
+    # If found, initialize the engine
+    if stockfish_path:
+        print(f"Found Stockfish at: {stockfish_path}")
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            engine.configure({"Threads": threads, "Hash": hash_size})
+            return engine
+        except Exception as e:
+            print(f"Error initializing Stockfish: {e}")
+    
+    # If not found or initialization failed, prompt user
+    print("Stockfish not found automatically.")
+    user_path = input("Please enter full path to Stockfish executable (or 'skip' to continue without Stockfish): ")
+    
+    if user_path.lower() == 'skip':
+        print("Warning: Continuing without Stockfish. Chess engine features will be disabled.")
+        return None
+        
+    # Try with user-provided path
+    if os.path.exists(user_path):
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(user_path)
+            engine.configure({"Threads": threads, "Hash": hash_size})
+            return engine
+        except Exception as e:
+            print(f"Error initializing Stockfish with provided path: {e}")
+            print("Continuing without Stockfish. Chess engine features will be disabled.")
+            return None
+    else:
+        print(f"File not found: {user_path}")
+        print("Continuing without Stockfish. Chess engine features will be disabled.")
+        return None
 
 
 def move_to_readable(move, board):
@@ -125,7 +217,8 @@ def move_to_readable(move, board):
 
 
 def capture_screenshot(bbox):
-    screenshot_path = "/tmp/chessboard.png"
+    temp_dir = tempfile.gettempdir()
+    screenshot_path = os.path.join(temp_dir, "chessboard.png")
     screenshot = ImageGrab.grab(bbox).convert("RGB")
     screenshot.save(screenshot_path)
     return screenshot_path
@@ -684,16 +777,26 @@ def validate_move(prev_board, new_board, max_piece_diff=2):
 
 def check_win(board_image):
     win_images = ["trophy.png", "crown.png"]
+    script_dir = os.path.dirname(os.path.realpath(__file__))
     board_gray = cv2.cvtColor(board_image, cv2.COLOR_BGR2GRAY)
-    for win_image_path in win_images:
-        win_image = cv2.imread(win_image_path, cv2.IMREAD_UNCHANGED)
-        if win_image is not None:
-            win_gray = cv2.cvtColor(win_image, cv2.COLOR_BGR2GRAY)
-            res = cv2.matchTemplate(board_gray, win_gray, cv2.TM_CCOEFF_NORMED)
-            threshold = 0.8
-            loc = np.where(res >= threshold)
-            if len(loc[0]) > 0:
-                return True
+    for win_image_name in win_images:
+        # Check multiple possible locations
+        possible_paths = [
+            win_image_name,
+            os.path.join(script_dir, win_image_name),
+            os.path.join(os.getcwd(), win_image_name)
+        ]
+        
+        for win_image_path in possible_paths:
+            if os.path.exists(win_image_path):
+                win_image = cv2.imread(win_image_path, cv2.IMREAD_UNCHANGED)
+                if win_image is not None:
+                    win_gray = cv2.cvtColor(win_image, cv2.COLOR_BGR2GRAY)
+                    res = cv2.matchTemplate(board_gray, win_gray, cv2.TM_CCOEFF_NORMED)
+                    threshold = 0.8
+                    loc = np.where(res >= threshold)
+                    if len(loc[0]) > 0:
+                        return True
     return False
 
 
@@ -749,25 +852,28 @@ def monitor_chessboard():
     engine = initialize_stockfish()
     current_skill = skill_level  # Initialize the skill level
 
+    # Get script directory for template images
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    
     piece_templates = {
-        "br": cv2.imread("black_rook.png"),
-        "bn": cv2.imread("black_knight.png"),
-        "bb": cv2.imread("black_bishop.png"),
-        "bq": cv2.imread("black_queen.png"),
-        "bk": cv2.imread("black_king.png"),
-        "bp": cv2.imread("black_pawn.png"),
-        "wr1": cv2.imread("white_rook.png"),
-        "wr2": cv2.imread("white_rook_withwhitebackground.png"),
-        "wn1": cv2.imread("white_knight.png"),
-        "wn2": cv2.imread("white_knight_withgreenbackground.png"),
-        "wb1": cv2.imread("white_bishop.png"),
-        "wb2": cv2.imread("white_bishop_withgreenbackground.png"),
-        "wq1": cv2.imread("white_queen.png"),
-        "wq2": cv2.imread("white_queen_withgreenbackground.png"),
-        "wk1": cv2.imread("white_king.png"),
-        "wk2": cv2.imread("white_king_withwhitebackground.png"),
-        "wp1": cv2.imread("white_pawn.png"),
-        "wp2": cv2.imread("white_pawn_withgreenbackground.png"),
+        "br": cv2.imread(os.path.join(script_dir, "black_rook.png")),
+        "bn": cv2.imread(os.path.join(script_dir, "black_knight.png")),
+        "bb": cv2.imread(os.path.join(script_dir, "black_bishop.png")),
+        "bq": cv2.imread(os.path.join(script_dir, "black_queen.png")),
+        "bk": cv2.imread(os.path.join(script_dir, "black_king.png")),
+        "bp": cv2.imread(os.path.join(script_dir, "black_pawn.png")),
+        "wr1": cv2.imread(os.path.join(script_dir, "white_rook.png")),
+        "wr2": cv2.imread(os.path.join(script_dir, "white_rook_withwhitebackground.png")),
+        "wn1": cv2.imread(os.path.join(script_dir, "white_knight.png")),
+        "wn2": cv2.imread(os.path.join(script_dir, "white_knight_withgreenbackground.png")),
+        "wb1": cv2.imread(os.path.join(script_dir, "white_bishop.png")),
+        "wb2": cv2.imread(os.path.join(script_dir, "white_bishop_withgreenbackground.png")),
+        "wq1": cv2.imread(os.path.join(script_dir, "white_queen.png")),
+        "wq2": cv2.imread(os.path.join(script_dir, "white_queen_withgreenbackground.png")),
+        "wk1": cv2.imread(os.path.join(script_dir, "white_king.png")),
+        "wk2": cv2.imread(os.path.join(script_dir, "white_king_withwhitebackground.png")),
+        "wp1": cv2.imread(os.path.join(script_dir, "white_pawn.png")),
+        "wp2": cv2.imread(os.path.join(script_dir, "white_pawn_withgreenbackground.png")),
     }
 
     board = chess.Board()  # Initialize the chess board
@@ -815,7 +921,7 @@ def monitor_chessboard():
             ) = extract_board_from_image(
                 board_image, piece_templates, cell_width, cell_height, playing_color
             )
-            cv2.imwrite("annotated_chessboard.png", annotated_board_image)
+            cv2.imwrite(os.path.join(script_dir, "annotated_chessboard.png"), annotated_board_image)
 
             # Validate the move
             if not validate_move(previous_board, current_board):
