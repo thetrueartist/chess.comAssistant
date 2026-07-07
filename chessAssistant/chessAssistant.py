@@ -1,11 +1,11 @@
 import os
+import platform
 import cv2
 import numpy as np
-import pyscreenshot as ImageGrab
-import torch
-import torchvision.transforms as transforms
-from torchvision.models import resnet50, ResNet50_Weights
-from PIL import Image
+if platform.system() == "Windows":
+    from PIL import ImageGrab
+else:
+    import pyscreenshot as ImageGrab
 import chess
 import chess.engine
 import threading
@@ -15,790 +15,2377 @@ import psutil
 import queue
 import logging
 import random
-import platform
 import tempfile
+import json
 
 # Configure logging
 logging.basicConfig(
     filename="chess_engine_error.log",
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# Load pre-trained ResNet50 model
-model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-model.eval()
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
-# Define image preprocessing
-preprocess = transforms.Compose(
-    [
-        transforms.Resize((256, 256)),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-)
+# Default configuration
+DEFAULT_CONFIG = {
+    "threads": max(4, os.cpu_count() // 2),
+    "hash_size": 4096,
+    "max_depth": 30,
+    "template_match_scales": [0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2],
+    "piece_detect_threshold": 0.12,
+    "board_redetect_interval": 30,  # Re-detect board location every N cycles
+    "move_stabilization_attempts": 5,
+    "move_stabilization_delay": 0.2,
+    "loop_delay": 0.4,
+}
 
 
-def get_user_input():
-    while True:
-        playing_color = (
-            input("Are you playing as white or black? (w/b): ").strip().lower()
-        )
-        if playing_color in ("w", "b"):
-            break
-        print("Invalid input. Please enter 'w' for white or 'b' for black.")
-
-    while True:
+def load_config():
+    """Load config from file, falling back to defaults."""
+    config = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_PATH):
         try:
-            skill_level = int(input("Enter the skill level (0-20): ").strip())
-            if 0 <= skill_level <= 20:
-                break
-            else:
-                raise ValueError
+            with open(CONFIG_PATH, "r") as f:
+                user_config = json.load(f)
+                config.update(user_config)
+        except Exception as e:
+            logging.warning(f"Failed to load config: {e}")
+    return config
+
+
+def save_config(config):
+    """Save current config to file."""
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+SESSION_PATH = os.path.join(SCRIPT_DIR, "last_session.json")
+
+def save_session(skill_level, use_randomizer, auto_move, game_mode, marathon):
+    """Save session settings for -r resume."""
+    with open(SESSION_PATH, "w") as f:
+        json.dump({
+            "skill_level": skill_level,
+            "use_randomizer": use_randomizer,
+            "auto_move": auto_move,
+            "game_mode": game_mode,
+            "marathon": marathon,
+        }, f, indent=2)
+
+
+def load_session():
+    """Load last session settings. Returns dict or None."""
+    if os.path.exists(SESSION_PATH):
+        try:
+            with open(SESSION_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+
+config = load_config()
+
+
+# ─── Game State Tracker ───────────────────────────────────────────────────────
+
+class GameState:
+    """
+    Tracks the full game state using python-chess as source of truth.
+    Properly handles castling rights, en passant, move counters, and turn.
+    """
+
+    def __init__(self, playing_color):
+        self.playing_color = playing_color
+        self.board = chess.Board()
+        self.move_history = []
+        self.detected_boards = []  # History of raw detected boards
+        self.is_our_turn = (playing_color == "w")
+        self.game_active = True
+        self.consecutive_same = 0
+        self.last_raw_board = None
+
+    def reset(self):
+        """Reset for a new game."""
+        self.board = chess.Board()
+        self.move_history = []
+        self.detected_boards = []
+        self.is_our_turn = (self.playing_color == "w")
+        self.game_active = True
+        self.consecutive_same = 0
+        self.last_raw_board = None
+
+    @property
+    def fen(self):
+        return self.board.fen()
+
+    @property
+    def piece_count(self):
+        return len(self.board.piece_map())
+
+    @property
+    def game_stage(self):
+        pc = self.piece_count
+        if pc > 25:
+            return "opening"
+        elif pc > 14:
+            return "middlegame"
+        return "endgame"
+
+    def detected_board_to_piece_map(self, raw_board):
+        """Convert our 8x8 detected array to a dict of {square: piece}."""
+        pieces = {}
+        for row in range(8):
+            for col in range(8):
+                p = raw_board[row][col]
+                if p:
+                    # Row 0 = rank 8, col 0 = file a
+                    square = chess.square(col, 7 - row)
+                    pieces[square] = p
+        return pieces
+
+    def _boards_match(self, raw_board):
+        """Check if detected board matches current python-chess board state.
+        First tries exact piece type match, then falls back to color-only
+        (handles template misidentification across different piece themes)."""
+        detected = self.detected_board_to_piece_map(raw_board)
+        current = {sq: p.symbol() for sq, p in self.board.piece_map().items()}
+        # Same occupied squares?
+        if set(detected.keys()) != set(current.keys()):
+            return False
+        # Exact match?
+        if all(detected[sq] == current[sq] for sq in detected):
+            return True
+        # Color-only match (same squares occupied, same colors, types may differ)
+        return all(detected[sq].isupper() == current[sq].isupper() for sq in detected)
+
+    def _color_map_from_raw(self, raw_board):
+        """Convert raw board with color-only markers (W/B) to {square: color}."""
+        colors = {}
+        for row in range(8):
+            for col in range(8):
+                p = raw_board[row][col]
+                if p == "W":
+                    colors[chess.square(col, 7 - row)] = "w"
+                elif p == "B":
+                    colors[chess.square(col, 7 - row)] = "b"
+                elif p:
+                    # Normal piece symbol — derive color from case
+                    sq = chess.square(col, 7 - row)
+                    colors[sq] = "w" if p.isupper() else "b"
+        return colors
+
+    def find_matching_move_color_only(self, raw_board):
+        """
+        Find a legal move using only piece color information (no piece types).
+        Works by checking which squares are occupied and piece colors after each legal move.
+        Returns the move or None.
+        """
+        detected_colors = self._color_map_from_raw(raw_board)
+        detected_occupied = set(detected_colors.keys())
+
+        best_match = None
+        best_score = -1
+        second_best_score = -1
+
+        for move in self.board.legal_moves:
+            test_board = self.board.copy()
+            test_board.push(move)
+            test_colors = {}
+            for sq, p in test_board.piece_map().items():
+                test_colors[sq] = "w" if p.color == chess.WHITE else "b"
+            test_occupied = set(test_colors.keys())
+
+            all_squares = detected_occupied | test_occupied
+            matches = sum(1 for sq in all_squares
+                          if detected_colors.get(sq) == test_colors.get(sq))
+            total = len(all_squares)
+            score = matches / max(total, 1)
+
+            if score > best_score:
+                second_best_score = best_score
+                best_score = score
+                best_match = move
+            elif score > second_best_score:
+                second_best_score = score
+
+        if best_score >= 0.95 and (best_score - second_best_score) >= 0.02:
+            return best_match
+        return None
+
+    def boards_match_color_only(self, raw_board):
+        """Check if detected board matches current state using only piece colors.
+        Tolerates up to 1 mismatched square for robustness."""
+        detected_colors = self._color_map_from_raw(raw_board)
+        current_colors = {}
+        for sq, p in self.board.piece_map().items():
+            current_colors[sq] = "w" if p.color == chess.WHITE else "b"
+        all_squares = set(list(detected_colors.keys()) + list(current_colors.keys()))
+        mismatches = sum(1 for sq in all_squares
+                         if detected_colors.get(sq) != current_colors.get(sq))
+        return mismatches <= 1
+
+    def find_matching_move(self, raw_board):
+        """
+        Given a newly detected board state, find which legal move
+        transforms our current board into the detected state.
+        Returns the move or None.
+        """
+        detected_pieces = self.detected_board_to_piece_map(raw_board)
+
+        best_match = None
+        best_score = -1
+        second_best_score = -1
+
+        for move in self.board.legal_moves:
+            test_board = self.board.copy()
+            test_board.push(move)
+
+            test_pieces = {sq: p.symbol() for sq, p in test_board.piece_map().items()}
+
+            # Compare all occupied squares
+            all_squares = set(list(detected_pieces.keys()) + list(test_pieces.keys()))
+            matches = sum(1 for sq in all_squares
+                          if detected_pieces.get(sq, "") == test_pieces.get(sq, ""))
+            total = len(all_squares)
+
+            score = matches / max(total, 1)
+            if score > best_score:
+                second_best_score = best_score
+                best_score = score
+                best_match = move
+            elif score > second_best_score:
+                second_best_score = score
+
+        # Require perfect or near-perfect match, AND clear separation from runner-up
+        if best_score >= 0.97 and (best_score - second_best_score) >= 0.02:
+            return best_match
+        return None
+
+    def update_from_detection(self, raw_board):
+        """
+        Update game state from a detected board.
+        Returns: 'our_turn', 'their_turn', 'no_change', 'synced', or 'uncertain'
+        """
+        # Check if board changed from last detection
+        if self.last_raw_board is not None:
+            changed = any(raw_board[i][j] != self.last_raw_board[i][j]
+                          for i in range(8) for j in range(8))
+            if not changed:
+                self.consecutive_same += 1
+                return "no_change"
+
+        self.consecutive_same = 0
+
+        # First check: does the detected board already match our current state?
+        if self._boards_match(raw_board):
+            self.last_raw_board = [row[:] for row in raw_board]
+            if self.is_our_turn:
+                return "our_turn"
+            return "their_turn"
+
+        # Try to find a matching legal move (exact piece types)
+        move = self.find_matching_move(raw_board)
+
+        # Fallback: try color-only matching if exact matching fails
+        # (handles piece type misidentification across themes)
+        if move is None:
+            move = self.find_matching_move_color_only(raw_board)
+            if move is not None:
+                logging.info(f"Color-only match found: {move.uci()}")
+
+        if move is not None:
+            self.board.push(move)
+            self.move_history.append(move)
+            self.last_raw_board = [row[:] for row in raw_board]
+            self.is_our_turn = not self.is_our_turn
+            logging.info(f"Detected move: {move.uci()}, FEN: {self.fen}")
+
+            if self.is_our_turn:
+                return "our_turn"
+            return "their_turn"
+
+        # No legal move matched — try sync from detection (with strict sanity checks)
+        # Skip sync if we just auto-played (phantom pieces from move highlights)
+        skip_sync = getattr(self, '_skip_sync_cycles', 0)
+        if skip_sync > 0:
+            self._skip_sync_cycles = skip_sync - 1
+            logging.info(f"Sync skipped ({skip_sync} remaining) — waiting for opponent move")
+            return "uncertain"
+
+        fen = self._raw_board_to_fen(raw_board)
+        try:
+            new_board = chess.Board(fen)
+            new_pieces = len(new_board.piece_map())
+            old_pieces = len(self.board.piece_map())
+
+            # Build maps for comparison
+            old_map = {sq: p.symbol() for sq, p in self.board.piece_map().items()}
+            new_map = {sq: p.symbol() for sq, p in new_board.piece_map().items()}
+            all_sq = set(list(old_map.keys()) + list(new_map.keys()))
+            diffs = sum(1 for sq in all_sq if old_map.get(sq) != new_map.get(sq))
+
+            # Reject criteria
+            rejected = False
+            if new_pieces > 32 or new_pieces < 2:
+                logging.warning(f"Sync rejected: bad piece count {new_pieces}")
+                rejected = True
+            elif new_pieces > old_pieces + 1:
+                logging.warning(f"Sync rejected: pieces jumped {old_pieces}→{new_pieces}")
+                rejected = True
+            elif old_pieces - new_pieces > 3:
+                logging.warning(f"Sync rejected: too many pieces lost {old_pieces}→{new_pieces}")
+                rejected = True
+            elif diffs > 6:
+                # A legal move changes max 4 squares (castling). >6 = detection garbage.
+                logging.warning(f"Sync rejected: {diffs} squares differ (max 6)")
+                rejected = True
+
+            if not rejected:
+                # Strip phantom pieces (+1 extra)
+                if new_pieces == old_pieces + 1:
+                    extra = [sq for sq in new_map if sq not in old_map]
+                    for sq in extra:
+                        new_board.remove_piece_at(sq)
+                    logging.info(f"Stripped phantom at {[chess.SQUARE_NAMES[s] for s in extra]}")
+
+                self.board = new_board
+                self.last_raw_board = [row[:] for row in raw_board]
+                self.is_our_turn = (self.board.turn == chess.WHITE) == (self.playing_color == "w")
+                logging.info(f"Board synced: {fen} ({diffs} diffs)")
+                if self.is_our_turn:
+                    return "our_turn"
+                return "synced"
+                self.board = new_board
+                self.last_raw_board = [row[:] for row in raw_board]
+                self.is_our_turn = (self.board.turn == chess.WHITE) == (self.playing_color == "w")
+                logging.info(f"Board synced from detection: {fen}")
+                if self.is_our_turn:
+                    return "our_turn"
+                return "synced"
         except ValueError:
-            print("Invalid input. Please enter a valid skill level between 0-20.")
+            pass
 
-    while True:
-        use_randomizer = (
-            input("Do you want to use a randomizer to avoid detection? (y/n): ")
-            .strip()
-            .lower()
-        )
-        if use_randomizer in ("y", "n"):
-            use_randomizer = use_randomizer == "y"
-            break
-        print("Invalid input. Please enter 'y' for yes or 'n' for no.")
+        # Can't match - might be mid-animation or detection error
+        # Don't update last_raw_board so next cycle retries matching
+        logging.warning("Could not match detected board to any legal move")
+        return "uncertain"
 
-    return playing_color, skill_level, use_randomizer
+    def update_from_detection_color_only(self, raw_board):
+        """
+        Update game state using only piece color information (no piece types).
+        Used when cells are too small for reliable template matching.
+        Returns same values as update_from_detection.
+        """
+        # Check if board changed
+        if self.last_raw_board is not None:
+            changed = any(raw_board[i][j] != self.last_raw_board[i][j]
+                          for i in range(8) for j in range(8))
+            if not changed:
+                self.consecutive_same += 1
+                return "no_change"
 
+        self.consecutive_same = 0
 
-playing_color, skill_level, use_randomizer = get_user_input()
+        # Check if colors match current state
+        if self.boards_match_color_only(raw_board):
+            self.last_raw_board = [row[:] for row in raw_board]
+            if self.is_our_turn:
+                return "our_turn"
+            return "their_turn"
 
-# Set default values for threads and hash size
-threads = max(5, os.cpu_count() // 2)  # Reduce the number of threads
-hash_size = 8192  # Increase the hash size to 8 GB
+        # Try color-only move matching
+        move = self.find_matching_move_color_only(raw_board)
+        if move is not None:
+            self.board.push(move)
+            self.move_history.append(move)
+            self.last_raw_board = [row[:] for row in raw_board]
+            self.is_our_turn = not self.is_our_turn
+            logging.info(f"Color-only detected move: {move.uci()}, FEN: {self.fen}")
+            if self.is_our_turn:
+                return "our_turn"
+            return "their_turn"
 
-# Capture the screen region where the chessboard is displayed
-bbox = (100, 100, 900, 900)  # Example bounding box
+        self.last_raw_board = [row[:] for row in raw_board]
+        logging.warning("Color-only: could not match board to any legal move")
+        return "uncertain"
 
-# Define a flag for stopping the background thread
-stop_flag = threading.Event()
-
-# Queue for communication between threads
-action_queue = queue.Queue()
-
-
-def signal_handler(sig, frame):
-    global stop_flag
-    stop_flag.set()
-    print("\nGracefully stopping...")
-    os._exit(0)
-
-
-signal.signal(signal.SIGINT, signal_handler)
-
-
-def initialize_stockfish():
-    # Get threads and hash_size from global scope or define them here
-    threads = 4  # Default value, replace with your global variable
-    hash_size = 256  # Default value, replace with your global variable
-    
-    def find_stockfish_exe():
-        """Find the Stockfish executable using a focused approach"""
-        # Common drive letters to check on Windows
-        drive_letters = ['C:', 'D:', 'E:']
-        common_folders = ['Downloads', 'Program Files', 'Program Files (x86)', 'Users']
-        
-        # First check the exact path we know about
-        exact_path = 'D:\\Downloads\\stockfish-windows-x86-64-avx2\\stockfish\\stockfish-windows-x86-64-avx2.exe'
-        if os.path.exists(exact_path) and os.path.isfile(exact_path):
-            return exact_path
-            
-        # Look for the stockfish-windows-x86-64-avx2\stockfish folder
-        for drive in drive_letters:
-            for folder in common_folders:
-                # Skip non-existent combinations
-                base_path = f"{drive}\\{folder}"
-                if not os.path.exists(base_path):
-                    continue
-                    
-                try:
-                    # Search for the specific folder pattern
-                    for root, dirs, files in os.walk(base_path):
-                        # Check if we're in a stockfish folder
-                        if "stockfish-windows-x86-64-avx2" in root and root.endswith("stockfish"):
-                            # Use the first .exe file we find
-                            for file in files:
-                                if file.endswith('.exe'):
-                                    return os.path.join(root, file)
-                            
-                        # Also check if the current path contains stockfish
-                        if "stockfish" in root.lower():
-                            for file in files:
-                                if file.endswith('.exe') and 'stockfish' in file.lower():
-                                    return os.path.join(root, file)
-                except (PermissionError, FileNotFoundError):
-                    # Skip if we can't access this location
-                    continue
-        
-        # Fallback to standard locations
-        if platform.system() == 'Windows':
-            standard_paths = [
-                os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), 'Stockfish', 'stockfish.exe'),
-                os.path.join(os.path.expanduser('~'), 'Downloads', 'stockfish.exe'),
-                'stockfish.exe'
-            ]
-        else:  # Linux/Mac
-            standard_paths = [
-                '/usr/games/stockfish',
-                '/usr/local/bin/stockfish',
-                '/usr/bin/stockfish',
-                'stockfish'
-            ]
-            
-        for path in standard_paths:
-            if os.path.exists(path) and os.path.isfile(path):
-                return path
-                
-        return None
-    
-    # Try to find Stockfish executable
-    stockfish_path = find_stockfish_exe()
-    
-    # If found, initialize the engine
-    if stockfish_path:
-        print(f"Found Stockfish at: {stockfish_path}")
+    def force_sync(self, raw_board):
+        """Force sync the board state from detection (used when tracking is lost)."""
+        fen = self._raw_board_to_fen(raw_board)
         try:
-            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-            engine.configure({"Threads": threads, "Hash": hash_size})
-            return engine
-        except Exception as e:
-            print(f"Error initializing Stockfish: {e}")
-    
-    # If not found or initialization failed, prompt user
-    print("Stockfish not found automatically.")
-    user_path = input("Please enter full path to Stockfish executable (or 'skip' to continue without Stockfish): ")
-    
-    if user_path.lower() == 'skip':
-        print("Warning: Continuing without Stockfish. Chess engine features will be disabled.")
-        return None
-        
-    # Try with user-provided path
-    if os.path.exists(user_path):
-        try:
-            engine = chess.engine.SimpleEngine.popen_uci(user_path)
-            engine.configure({"Threads": threads, "Hash": hash_size})
-            return engine
-        except Exception as e:
-            print(f"Error initializing Stockfish with provided path: {e}")
-            print("Continuing without Stockfish. Chess engine features will be disabled.")
-            return None
-    else:
-        print(f"File not found: {user_path}")
-        print("Continuing without Stockfish. Chess engine features will be disabled.")
-        return None
+            new_board = chess.Board(fen)
+            self.board = new_board
+            self.last_raw_board = [row[:] for row in raw_board]
+            self.is_our_turn = (self.board.turn == chess.WHITE) == (self.playing_color == "w")
+            logging.info(f"Force synced board: {fen}")
+            return True
+        except ValueError as e:
+            logging.error(f"Force sync failed: {e}")
+            return False
+
+    def _raw_board_to_fen(self, raw_board):
+        """Convert raw 8x8 array to FEN position string with proper metadata."""
+        fen_rows = []
+        for row in raw_board:
+            fen_row = ""
+            empty = 0
+            for cell in row:
+                if cell == "":
+                    empty += 1
+                else:
+                    if empty > 0:
+                        fen_row += str(empty)
+                        empty = 0
+                    fen_row += cell
+            if empty > 0:
+                fen_row += str(empty)
+            fen_rows.append(fen_row)
+
+        position = "/".join(fen_rows)
+
+        # Determine turn from whose perspective we're playing
+        turn = "w" if self.is_our_turn == (self.playing_color == "w") else "b"
+
+        # Infer castling rights from piece positions
+        castling = ""
+        # White king on e1, rooks on a1/h1
+        if raw_board[7][4] == "K":
+            if raw_board[7][7] == "R":
+                castling += "K"
+            if raw_board[7][0] == "R":
+                castling += "Q"
+        if raw_board[0][4] == "k":
+            if raw_board[0][7] == "r":
+                castling += "k"
+            if raw_board[0][0] == "r":
+                castling += "q"
+        if not castling:
+            castling = "-"
+
+        return f"{position} {turn} {castling} - 0 1"
 
 
-def move_to_readable(move, board):
-    piece = board.piece_at(move.from_square)
-    piece_name = piece.symbol().upper() if piece else ""
-    from_square = chess.SQUARE_NAMES[move.from_square]
-    to_square = chess.SQUARE_NAMES[move.to_square]
-    piece_map = {
-        "P": "pawn",
-        "N": "knight",
-        "B": "bishop",
-        "R": "rook",
-        "Q": "queen",
-        "K": "king",
-    }
-    return f"\033[1m\033[92mMove {piece_map.get(piece_name, '')} from {from_square} to {to_square}\033[0m"
+# ─── Screen Capture ───────────────────────────────────────────────────────────
 
-
-def capture_screenshot(bbox):
+def capture_screenshot(bbox=None):
+    """Capture screen region. If bbox is None, captures full screen."""
     temp_dir = tempfile.gettempdir()
     screenshot_path = os.path.join(temp_dir, "chessboard.png")
-    screenshot = ImageGrab.grab(bbox).convert("RGB")
+    if bbox:
+        screenshot = ImageGrab.grab(bbox).convert("RGB")
+    else:
+        screenshot = ImageGrab.grab().convert("RGB")
     screenshot.save(screenshot_path)
     return screenshot_path
 
 
-def detect_chessboard(image_path):
-    image = cv2.imread(image_path)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        chessboard_contour = max(contours, key=cv2.contourArea)
-        epsilon = 0.1 * cv2.arcLength(chessboard_contour, True)
-        approx = cv2.approxPolyDP(chessboard_contour, epsilon, True)
-        if len(approx) == 4:
-            pts = approx.reshape(4, 2)
-            rect = np.zeros((4, 2), dtype="float32")
-            s = pts.sum(axis=1)
-            rect[0] = pts[np.argmin(s)]
-            rect[2] = pts[np.argmax(s)]
-            diff = np.diff(pts, axis=1)
-            rect[1] = pts[np.argmin(diff)]
-            rect[3] = pts[np.argmax(diff)]
-            (tl, tr, br, bl) = rect
-            widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-            widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-            maxWidth = max(int(widthA), int(widthB))
-            heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-            heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-            maxHeight = max(int(heightA), int(heightB))
-            dst = np.array(
-                [
-                    [0, 0],
-                    [maxWidth - 1, 0],
-                    [maxWidth - 1, maxHeight - 1],
-                    [0, maxHeight - 1],
-                ],
-                dtype="float32",
-            )
-            M = cv2.getPerspectiveTransform(rect, dst)
-            warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-            return warped, maxWidth // 8, maxHeight // 8
-    return None, None, None
+# ─── Board Detection ──────────────────────────────────────────────────────────
+
+# HSV color ranges for chess.com square backgrounds (default green theme)
+# Includes normal, highlighted (last move), and selected variants
+# Ranges for BOARD DETECTION (find_board_by_colors)
+# Covers chess.com green theme + highlighted/selected squares.
+BOARD_DETECT_COLOR_RANGES = [
+    # Normal light squares (cream/beige)
+    (np.array([13, 0, 165]), np.array([47, 100, 255])),
+    # Normal dark squares (green/olive)
+    (np.array([23, 35, 55]), np.array([82, 235, 205])),
+    # Highlighted light (more saturated yellow-green)
+    (np.array([20, 80, 170]), np.array([50, 160, 255])),
+    # Highlighted dark (brighter green)
+    (np.array([25, 60, 100]), np.array([60, 255, 220])),
+    # Opponent move highlight — teal/cyan (H≈100, S≈110, V≈210)
+    (np.array([85, 50, 150]), np.array([115, 180, 255])),
+]
+
+# Tight ranges for PIECE DETECTION (background masking) — avoid eating white pieces
+SQUARE_COLOR_RANGES = [
+    # Normal light (cream) — tight S upper bound to avoid matching white piece pixels
+    (np.array([15, 15, 185]), np.array([45, 80, 255])),
+    # Normal dark (green/olive)
+    (np.array([25, 40, 60]), np.array([82, 210, 195])),
+    # Highlighted light (yellow/green tint)
+    (np.array([18, 60, 170]), np.array([55, 255, 255])),
+    # Highlighted dark (olive)
+    (np.array([22, 60, 110]), np.array([60, 255, 220])),
+    # Opponent move highlight — teal/cyan
+    (np.array([85, 50, 150]), np.array([115, 180, 255])),
+]
 
 
-def preprocess_board_image(image):
-    # Contrast enhancement
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    enhanced = cv2.merge((cl, a, b))
-    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+def _board_sanity_check(image, x, y, w, h):
+    """
+    Verify a candidate board region by checking piece colors form a
+    plausible chess position. Fast — no template matching.
+    Returns True if the region looks like a real chessboard.
+    """
+    cell_w = w / 8
+    cell_h = h / 8
 
-    # Denoise
-    denoised = cv2.fastNlMeansDenoisingColored(enhanced)
-    return denoised
+    whites, blacks, empty = 0, 0, 0
+    ranks_with_pieces = set()
 
+    for row in range(8):
+        for col in range(8):
+            x1 = int(x + col * cell_w)
+            y1 = int(y + row * cell_h)
+            x2 = int(x1 + cell_w)
+            y2 = int(y1 + cell_h)
+            if y2 > image.shape[0] or x2 > image.shape[1]:
+                continue
+            cell = image[y1:y2, x1:x2]
+            color, ratio = classify_cell_color(cell)
+            if color == "w":
+                whites += 1
+                ranks_with_pieces.add(row)
+            elif color == "b":
+                blacks += 1
+                ranks_with_pieces.add(row)
+            else:
+                empty += 1
 
-def match_template(piece_image, board_image, threshold=0.7):
-    # Multi-scale template matching
-    piece_gray = cv2.cvtColor(piece_image, cv2.COLOR_BGR2GRAY)
-    board_gray = cv2.cvtColor(board_image, cv2.COLOR_BGR2GRAY)
+    total = whites + blacks
 
-    scales = np.linspace(0.8, 1.2, 5)
-    matches = []
-
-    for scale in scales:
-        resized = cv2.resize(piece_gray, None, fx=scale, fy=scale)
-        res = cv2.matchTemplate(board_gray, resized, cv2.TM_CCOEFF_NORMED)
-        locations = np.where(res >= threshold)
-        for loc in zip(*locations[::-1]):
-            matches.append((loc, scale, res[loc[1]][loc[0]]))
-
-    # Non-maximum suppression
-    matches.sort(key=lambda x: x[2], reverse=True)
-    filtered_matches = []
-    for m1 in matches:
-        should_add = True
-        for m2 in filtered_matches:
-            dist = np.sqrt((m1[0][0] - m2[0][0]) ** 2 + (m1[0][1] - m2[0][1]) ** 2)
-            if dist < 20:  # Adjust threshold as needed
-                should_add = False
-                break
-        if should_add:
-            filtered_matches.append(m1)
-
-    return [m[0] for m in filtered_matches]
-
-
-def validate_board_state(board, prev_board=None):
-    # Basic chess rules validation
-    piece_counts = {"P": 0, "p": 0, "K": 0, "k": 0}
-    for row in board:
-        for piece in row:
-            if piece in piece_counts:
-                piece_counts[piece] += 1
-
-    # Validate piece counts
-    if piece_counts["K"] != 1 or piece_counts["k"] != 1:
+    if total < 4 or total > 34:
         return False
-    if piece_counts["P"] > 8 or piece_counts["p"] > 8:
+    if whites < 1 or blacks < 1:
         return False
+    if len(ranks_with_pieces) < 3:
+        return False
+    if empty < 20:
+        return False
+    if total >= 10 and whites >= 3 and blacks >= 3:
+        return True
 
-    # Validate move if previous board exists
-    if prev_board is not None:
-        changes = sum(
-            1 for i in range(8) for j in range(8) if board[i][j] != prev_board[i][j]
-        )
-        if changes > 4:  # Max changes for castling
-            return False
-
-    return True
+    return False
 
 
-def detect_movement(prev_image, curr_image, threshold=0.1):
-    diff = cv2.absdiff(prev_image, curr_image)
-    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray_diff, 25, 255, cv2.THRESH_BINARY)
+def find_board_by_colors(image):
+    """
+    Find the chessboard on screen by detecting chess.com's
+    checkerboard pattern. Resolution-independent.
+    Handles normal, highlighted, and selected square colors.
+    Returns (x, y, width, height) of the board, or None.
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # Find contours of movement
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Combine all square color masks (use wide ranges for board finding)
+    board_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in BOARD_DETECT_COLOR_RANGES:
+        mask = cv2.inRange(hsv, lower, upper)
+        board_mask = cv2.bitwise_or(board_mask, mask)
 
-    # Filter and analyze movement patterns
-    valid_movements = []
+    # Find contours with light morphology to avoid merging with UI
+    kernel = np.ones((3, 3), np.uint8)
+    clean_mask = cv2.morphologyEx(board_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    min_area = 350 * 350  # Minimum board size — excludes preview thumbnails
+    scored_candidates = []
+
     for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if 100 < area < 5000:  # Adjust thresholds based on board size
-            x, y, w, h = cv2.boundingRect(cnt)
-            valid_movements.append((x + w / 2, y + h / 2))
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        if area < min_area:
+            continue
 
-    return len(valid_movements) > 0, valid_movements
+        ratio = w / h if h > 0 else 0
+        # Generate square candidates from this contour
+        candidates = []
+
+        if 0.85 < ratio < 1.18:
+            # Nearly square — use directly and as square-forced
+            candidates.append((x, y, w, h))
+            side = min(w, h)
+            if abs(w - h) > 4:
+                # Try alignments for the square version
+                for frac in [0.0, 0.5, 1.0]:
+                    if h > w:
+                        dy = int((h - side) * frac)
+                        candidates.append((x, y + dy, side, side))
+                    else:
+                        dx = int((w - side) * frac)
+                        candidates.append((x + dx, y, side, side))
+
+        # If contour is large and non-square, try sub-regions
+        # (handles case where board merged with sidebar)
+        if area > min_area * 4:
+            side = min(w, h)
+            for size_frac in [0.5, 0.6, 0.75]:
+                sub_side = int(side * size_frac)
+                if sub_side * sub_side < min_area:
+                    continue
+                for fx in [0.0, 0.5, 1.0]:
+                    for fy in [0.0, 0.25, 0.5, 0.75, 1.0]:
+                        sx = x + int((w - sub_side) * fx)
+                        sy = y + int((h - sub_side) * fy)
+                        if sx + sub_side <= image.shape[1] and sy + sub_side <= image.shape[0]:
+                            candidates.append((sx, sy, sub_side, sub_side))
+
+        for cx, cy, cw, ch in candidates:
+            if cx < 0 or cy < 0 or cx + cw > image.shape[1] or cy + ch > image.shape[0]:
+                continue
+            score = _validate_checkerboard(image, cx, cy, cw, ch)
+            if score >= 0.4:
+                scored_candidates.append((score, cx, cy, cw, ch))
+
+    if not scored_candidates:
+        return None
+
+    # Sort by checkerboard score, then sanity-check top candidates
+    scored_candidates.sort(key=lambda t: t[0], reverse=True)
+
+    for score, cx, cy, cw, ch in scored_candidates[:20]:
+        # Fine-tune alignment using checkerboard pattern
+        best = (cx, cy, cw, ch)
+        best_score = score
+        for dx in range(-8, 9, 2):
+            for dy in range(-8, 9, 2):
+                nx, ny = cx + dx, cy + dy
+                if nx >= 0 and ny >= 0 and nx + cw <= image.shape[1] and ny + ch <= image.shape[0]:
+                    s = _validate_checkerboard(image, nx, ny, cw, ch)
+                    if s > best_score:
+                        best_score = s
+                        best = (nx, ny, cw, ch)
+
+        bx, by, bw, bh = best
+        if _board_sanity_check(image, bx, by, bw, bh):
+            return best
+
+    # Fallback: return the top scoring candidate without sanity check
+    _, cx, cy, cw, ch = scored_candidates[0]
+    return (cx, cy, cw, ch)
 
 
-def extract_board_from_image(
-    board_image, piece_templates, cell_width, cell_height, playing_color
-):
-    board = np.full((8, 8), "", dtype=str)
-    piece_count = 0  # Initialize piece count
-    for piece, template in piece_templates.items():
-        if template is not None:
-            positions = match_template(template, board_image, threshold=0.7)
-            for pos in positions:
-                x, y = pos
-                row = y // cell_height
-                col = x // cell_width
-                piece_type = piece[1] if piece[0] == "b" else piece[1].upper()
-                if playing_color == "b":
-                    row, col = 7 - row, 7 - col  # Flip the board for black
-                if board[row, col] == "":
-                    piece_count += 1
-                board[row, col] = piece_type
-                cv2.rectangle(
-                    board_image,
-                    (x, y),
-                    (x + template.shape[1], y + template.shape[0]),
-                    (0, 255, 0),
-                    2,
-                )
-                cv2.putText(
-                    board_image,
-                    piece_type,
-                    (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 0),
-                    2,
-                )
-    return board, board_image, piece_count  # Return piece count as well
+def _classify_pixel_square_color(hsv_pixel):
+    """Classify an HSV pixel as light square, dark square, or unknown."""
+    h, s, v = int(hsv_pixel[0]), int(hsv_pixel[1]), int(hsv_pixel[2])
+    # Light squares: cream/beige (normal or highlighted)
+    is_light = ((15 <= h <= 50 and s < 100 and v > 170) or
+                (20 <= h <= 50 and s > 60 and v > 170))
+    # Dark squares: green (normal or highlighted olive)
+    is_dark = ((25 <= h <= 85 and s > 40 and 60 < v < 200) or
+               (25 <= h <= 60 and s > 60 and 100 < v < 220))
+    if is_light:
+        return "light"
+    if is_dark:
+        return "dark"
+    return None
 
 
-def board_to_fen(board):
-    fen = ""
-    for row in board:
-        empty_count = 0
-        for cell in row:
-            if cell == "":
-                empty_count += 1
+def _validate_checkerboard(image, x, y, w, h):
+    """
+    Validate that a region contains an actual 8x8 checkerboard pattern.
+    Uses two methods:
+    1. Cell-based: samples corners, checks alternating light/dark pattern
+    2. Transition-based: counts color transitions along scan lines (should be ~7 per line)
+    The transition check rejects regions at wrong scales (2x board would have ~14 transitions).
+    Returns a confidence score 0-1.
+    """
+    roi = image[y:y+h, x:x+w]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    cell_w = w / 8
+    cell_h = h / 8
+
+    # --- Method 1: Cell-based alternating pattern ---
+    alternating_count = 0
+    total_checks = 0
+    offsets = [(0.12, 0.12), (0.88, 0.12), (0.12, 0.88), (0.88, 0.88)]
+
+    for row in range(8):
+        for col in range(8):
+            expected_light = (row + col) % 2 == 0
+            votes_light = 0
+            votes_dark = 0
+            for ox, oy in offsets:
+                px = int(col * cell_w + cell_w * ox)
+                py = int(row * cell_h + cell_h * oy)
+                if py >= hsv.shape[0] or px >= hsv.shape[1]:
+                    continue
+                c = _classify_pixel_square_color(hsv[py, px])
+                if c == "light":
+                    votes_light += 1
+                elif c == "dark":
+                    votes_dark += 1
+            if votes_light + votes_dark >= 2:
+                total_checks += 1
+                is_light = votes_light > votes_dark
+                if (expected_light and is_light) or (not expected_light and not is_light):
+                    alternating_count += 1
+
+    if total_checks < 16:
+        return 0.0
+    pattern_score = alternating_count / total_checks
+
+    # --- Method 2: Transition spacing verification ---
+    # Scan lines and check that transitions happen at positions consistent
+    # with the assumed cell size (w/8). If the board is at wrong scale,
+    # transitions will be spaced at a different interval.
+    expected_cell = w / 8  # Expected cell width in pixels
+    spacing_scores = []
+    sample_fracs = [0.15, 0.35, 0.5, 0.65, 0.85]
+
+    for frac in sample_fracs:
+        for horizontal in [True, False]:
+            if horizontal:
+                scan_len = w
+                fixed = int(h * frac)
+                if fixed >= hsv.shape[0]:
+                    continue
             else:
-                if empty_count > 0:
-                    fen += str(empty_count)
-                    empty_count = 0
-                fen += cell
-        if empty_count > 0:
-            fen += str(empty_count)
-        fen += "/"
-    fen = fen[:-1]
-    if playing_color == "b":
-        fen += " b KQkq - 0 1"
-    else:
-        fen += " w KQkq - 0 1"
-    return fen
+                scan_len = h
+                fixed = int(w * frac)
+                if fixed >= hsv.shape[1]:
+                    continue
 
-
-def get_dynamic_move_time(piece_count, use_randomizer):
-    """
-    Determines the dynamic move time based on the stage of the game.
-    """
-    if use_randomizer:
-        if random.random() < 0.1:
-            return random.uniform(0.1, 1.0)
-        else:
-            return random.uniform(0.1, 0.5)
-    else:
-        game_stage = get_game_stage(piece_count)
-        print(f"Game stage detected: {game_stage}")  # Debug print
-        logging.info(f"Game stage detected: {game_stage}")
-        if game_stage == "opening":
-            return 0.3  # 1.5 seconds in the opening
-        elif game_stage == "middlegame":
-            return 0.5  # 2.5 seconds in the middlegame
-        else:  # endgame
-            return 0.8  # 4 seconds in the endgame
-
-
-def get_game_stage(piece_count):
-    """
-    Determines the stage of the game: opening, middlegame, or endgame.
-    """
-    logging.debug(f"Piece count: {piece_count}")
-    print(f"Debug - Piece count: {piece_count}")  # Debug print
-
-    # Adjust thresholds as needed based on your understanding of the game phases
-    if piece_count > 25:
-        return "opening"
-    elif 14 < piece_count <= 25:
-        return "middlegame"
-    else:
-        return "endgame"
-
-
-def get_move_entropy(moves):
-    """Calculate position complexity to vary play strength"""
-    scores = [move["score"].relative.score() for move in moves]
-    score_range = max(scores) - min(scores)
-    return score_range / 100  # Normalized complexity score
-
-
-def get_best_move_with_dynamic_time(
-    engine,
-    fen,
-    piece_count,
-    use_randomizer,
-    skill_level,
-    opponent_rating=None,
-    retries=3,
-):
-    """
-    Determines the best move dynamically while maintaining anti-detection mechanics.
-    Enhanced to handle None scores and late-game scenarios better.
-    """
-    for attempt in range(retries):
-        try:
-            board = chess.Board(fen)
-
-            # Adjust base depth based on piece count for late game
-            if piece_count <= 16:  # Late game
-                base_depth = random.randint(18, 22)
-                min_depth = 18
-            elif piece_count <= 25:  # Middle game
-                base_depth = random.randint(15, 22)
-                min_depth = 15
-            else:  # Opening
-                base_depth = random.randint(15, 20)
-                min_depth = 15
-
-            entropy = 0
-
-            # Force higher depth in critical positions
-            try:
-                quick_analysis = engine.analyse(
-                    board, chess.engine.Limit(depth=10), multipv=3
-                )
-                top_scores = []
-                for move in quick_analysis:
-                    score = move["score"].relative.score()
-                    if score is not None:
-                        top_scores.append(score)
-
-                if top_scores:  # Only calculate if we have valid scores
-                    score_diff = max(abs(score) for score in top_scores)
-                    if score_diff > 150:  # Critical position
-                        base_depth = max(base_depth, 20)
-            except Exception as e:
-                logging.error(f"Quick analysis failed: {e}")
-
-            # Calculate entropy with safe score handling
-            try:
-                quick_moves = engine.analyse(
-                    board, chess.engine.Limit(depth=8), multipv=3
-                )
-                valid_scores = []
-                for move in quick_moves:
-                    score = move["score"].relative.score()
-                    if score is not None:
-                        valid_scores.append(score)
-
-                if valid_scores:
-                    score_range = max(valid_scores) - min(valid_scores)
-                    entropy = score_range / 100
+            # Find transition positions
+            transitions = []
+            last_class = None
+            step = max(1, scan_len // 100)
+            for i in range(0, scan_len, step):
+                if horizontal:
+                    if i >= hsv.shape[1]:
+                        break
+                    c = _classify_pixel_square_color(hsv[fixed, i])
                 else:
-                    entropy = 0.3  # Default to moderate complexity
-            except Exception as e:
-                logging.error(f"Entropy calculation failed: {e}")
-                entropy = 0.3
+                    if i >= hsv.shape[0]:
+                        break
+                    c = _classify_pixel_square_color(hsv[i, fixed])
+                if c is not None:
+                    if last_class is not None and c != last_class:
+                        transitions.append(i)
+                    last_class = c
 
-            depth = max(
-                base_depth + (int(entropy * 1) if entropy > 0.3 else 0), min_depth
-            )
+            if len(transitions) < 4:
+                continue
 
-            # Add this line to limit the maximum depth to 30
-            depth = min(depth, 30)  # Limit depth to a maximum of 30
+            # Check spacing between consecutive transitions
+            spacings = [transitions[i+1] - transitions[i] for i in range(len(transitions)-1)]
+            if not spacings:
+                continue
+            median_spacing = sorted(spacings)[len(spacings) // 2]
 
-            print(f"Selected depth for this move: {depth}")
-            logging.info(f"Selected depth for this move: {depth}")
+            # Score: how close is the median spacing to the expected cell size?
+            spacing_ratio = median_spacing / expected_cell if expected_cell > 0 else 0
+            # Perfect = 1.0, double = 0.5 or 2.0 → both wrong
+            s = max(0, 1.0 - abs(spacing_ratio - 1.0))
+            # Also check count: should be 5-9 transitions (7 ideal, some may be missed)
+            count_score = max(0, 1.0 - abs(len(transitions) - 7) / 5)
+            spacing_scores.append(s * 0.7 + count_score * 0.3)
 
-            start_time = time.time()
+    if not spacing_scores:
+        return pattern_score * 0.5
 
-            try:
-                analysis = engine.analyse(
-                    board,
-                    chess.engine.Limit(depth=depth),
-                    multipv=5,
-                    options={"Skill Level": skill_level},
-                )
-            except Exception as e:
-                logging.error(f"Depth-based analysis failed: {e}")
-                time_limit = 2.0 if piece_count <= 16 else 1.0
-                analysis = engine.analyse(
-                    board,
-                    chess.engine.Limit(time=time_limit),
-                    multipv=5,
-                    options={"Skill Level": skill_level},
-                )
+    spacing_score = sum(spacing_scores) / len(spacing_scores)
 
-            end_time = time.time()
-            actual_thinking_time = end_time - start_time
+    # Combined: pattern + spacing must both be good
+    return pattern_score * 0.5 + spacing_score * 0.5
 
-            print(f"Actual thinking time: {actual_thinking_time:.2f} seconds")
-            logging.info(f"Actual thinking time: {actual_thinking_time:.2f} seconds")
 
-            if not analysis:
-                raise Exception("No analysis returned")
+def get_background_mask(cell_img):
+    """
+    Create a mask of background (square color) pixels.
+    Handles normal, highlighted, selected, and check-highlighted squares.
+    """
+    hsv = cv2.cvtColor(cell_img, cv2.COLOR_BGR2HSV)
+    bg_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in SQUARE_COLOR_RANGES:
+        mask = cv2.inRange(hsv, lower, upper)
+        bg_mask = cv2.bitwise_or(bg_mask, mask)
 
-            best_move = analysis[0]["pv"][0]
-            best_move_score = analysis[0]["score"].relative.score()
+    # Also catch check highlights (reddish squares)
+    red_lower1 = np.array([0, 50, 100])
+    red_upper1 = np.array([15, 255, 255])
+    red_lower2 = np.array([165, 50, 100])
+    red_upper2 = np.array([180, 255, 255])
+    red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, red_lower1, red_upper1),
+        cv2.inRange(hsv, red_lower2, red_upper2),
+    )
+    bg_mask = cv2.bitwise_or(bg_mask, red_mask)
 
-            # Handle None scores
-            if best_move_score is None:
-                best_move_score = 0  # Default to neutral position if score is None
+    return bg_mask
 
-            if not best_move or not board.is_legal(best_move):
-                raise Exception("Invalid move generated")
 
-            print(f"Best move: {best_move}, Score: {best_move_score}")
-            logging.info(f"Best move: {best_move}, Score: {best_move_score}")
+def classify_cell_color(cell_img):
+    """
+    Determine if a cell has a piece and whether it's white or black.
+    Handles all chess.com square color variants (normal, highlighted, check).
+    Uses the inner region of the cell to avoid edge artifacts.
+    """
+    bg_mask = get_background_mask(cell_img)
+    total = cell_img.shape[0] * cell_img.shape[1]
+    bg_count = cv2.countNonZero(bg_mask)
+    piece_ratio = 1 - (bg_count / total)
 
-            position_advantage = (
-                best_move_score / 100 if best_move_score is not None else 0
-            )
-            if abs(position_advantage) > 1.5:
-                max_diff = 80 + abs(position_advantage) * 8
+    if piece_ratio < config["piece_detect_threshold"]:
+        return "", piece_ratio
+
+    # Use inner 60% of cell to avoid background bleed at edges
+    h, w = cell_img.shape[:2]
+    margin_y = int(h * 0.2)
+    margin_x = int(w * 0.2)
+    inner = cell_img[margin_y:h-margin_y, margin_x:w-margin_x]
+
+    if inner.size == 0:
+        return "", piece_ratio
+
+    # Check brightness of inner region (ignoring background-colored pixels)
+    inner_bg = get_background_mask(inner)
+    inner_piece = cv2.bitwise_not(inner_bg)
+    gray = cv2.cvtColor(inner, cv2.COLOR_BGR2GRAY)
+    nonzero = gray[inner_piece > 0]
+
+    if len(nonzero) == 0:
+        # No non-background pixels in center — use full cell brightness
+        piece_mask = cv2.bitwise_not(bg_mask)
+        full_gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
+        nonzero = full_gray[piece_mask > 0]
+        if len(nonzero) == 0:
+            return "", piece_ratio
+
+    # Use median instead of mean — more robust to dark outlines on white pieces
+    median_brightness = np.median(nonzero)
+    # Also check: what fraction of piece pixels are "bright" (>150)?
+    bright_ratio = np.sum(nonzero > 150) / len(nonzero)
+
+    # White pieces: mostly bright pixels. Black pieces: mostly dark.
+    if median_brightness > 140 or bright_ratio > 0.4:
+        return "w", piece_ratio
+    else:
+        return "b", piece_ratio
+
+
+# ─── Piece Identification ─────────────────────────────────────────────────────
+
+def load_piece_templates():
+    """Load all piece template images from script directory."""
+    templates = {}
+    template_files = {
+        "br": "black_rook.png", "bn": "black_knight.png",
+        "bb": "black_bishop.png", "bq": "black_queen.png",
+        "bk": "black_king.png", "bp": "black_pawn.png",
+        "wr": "white_rook.png", "wn": "white_knight.png",
+        "wb": "white_bishop.png", "wq": "white_queen.png",
+        "wk": "white_king.png", "wp": "white_pawn.png",
+    }
+    alt_files = {
+        "wr_alt": "white_rook_withwhitebackground.png",
+        "wn_alt": "white_knight_withgreenbackground.png",
+        "wb_alt": "white_bishop_withgreenbackground.png",
+        "wq_alt": "white_queen_withgreenbackground.png",
+        "wk_alt": "white_king_withwhitebackground.png",
+        "wp_alt": "white_pawn_withgreenbackground.png",
+    }
+    for key, fname in {**template_files, **alt_files}.items():
+        path = os.path.join(SCRIPT_DIR, fname)
+        if os.path.exists(path):
+            img = cv2.imread(path)
+            if img is not None:
+                templates[key] = img
+    return templates
+
+
+def match_piece_in_cell(cell_img, templates, piece_color, cell_size):
+    """
+    Identify piece type using per-cell template matching.
+    Templates are auto-scaled to match the detected cell size.
+    """
+    prefix = "w" if piece_color == "w" else "b"
+    candidates = {}
+    for key, tmpl in templates.items():
+        base = key.replace("_alt", "")
+        if base.startswith(prefix):
+            ptype = base[1]
+            if ptype not in candidates:
+                candidates[ptype] = []
+            candidates[ptype].append(tmpl)
+
+    best_score = -1
+    best_type = "p"
+    cell_gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
+
+    for ptype, tmpls in candidates.items():
+        for tmpl in tmpls:
+            th, tw = tmpl.shape[:2]
+            scale = (cell_size * 0.9) / max(th, tw)
+            nw, nh = int(tw * scale), int(th * scale)
+            if nw <= 0 or nh <= 0 or nw >= cell_img.shape[1] or nh >= cell_img.shape[0]:
+                continue
+            tmpl_gray = cv2.cvtColor(cv2.resize(tmpl, (nw, nh)), cv2.COLOR_BGR2GRAY)
+            for es in config["template_match_scales"]:
+                sw, sh = int(nw * es), int(nh * es)
+                if sw <= 0 or sh <= 0 or sw >= cell_img.shape[1] or sh >= cell_img.shape[0]:
+                    continue
+                scaled = cv2.resize(tmpl_gray, (sw, sh))
+                result = cv2.matchTemplate(cell_gray, scaled, cv2.TM_CCOEFF_NORMED)
+                _, maxv, _, _ = cv2.minMaxLoc(result)
+                if maxv > best_score:
+                    best_score = maxv
+                    best_type = ptype
+
+    if piece_color == "w":
+        pmap = {"r": "R", "n": "N", "b": "B", "q": "Q", "k": "K", "p": "P"}
+    else:
+        pmap = {"r": "r", "n": "n", "b": "b", "q": "q", "k": "k", "p": "p"}
+    return pmap.get(best_type, "")
+
+
+# ─── Board Extraction ─────────────────────────────────────────────────────────
+
+def extract_board_from_image(full_image, piece_templates, board_bounds, playing_color,
+                             color_only=False):
+    """
+    Extract board state using color-based detection + per-cell template matching.
+    If color_only=True, skips template matching and returns just piece colors
+    (e.g., "W" for white piece, "B" for black piece) — used as fallback for
+    small cells or when template matching is unreliable.
+    Returns: board array (8x8), annotated image, piece count
+    """
+    bx, by, bw, bh = board_bounds
+    cell_w = bw / 8
+    cell_h = bh / 8
+    cell_size = int((cell_w + cell_h) / 2)
+
+    board = [["" for _ in range(8)] for _ in range(8)]
+    piece_count = 0
+    annotated = full_image.copy()
+
+    # Draw board grid
+    for i in range(9):
+        x = int(bx + i * cell_w)
+        cv2.line(annotated, (x, by), (x, by + bh), (0, 255, 0), 1)
+        y = int(by + i * cell_h)
+        cv2.line(annotated, (bx, y), (bx + bw, y), (0, 255, 0), 1)
+
+    for row in range(8):
+        for col in range(8):
+            x1 = int(bx + col * cell_w)
+            y1 = int(by + row * cell_h)
+            x2 = int(x1 + cell_w)
+            y2 = int(y1 + cell_h)
+            cell_img = full_image[y1:y2, x1:x2]
+
+            color, ratio = classify_cell_color(cell_img)
+            if not color:
+                continue
+
+            if color_only:
+                # Just record that there's a piece of this color
+                piece = "?" if color == "w" else "?"  # Placeholder
+                # Use uppercase/lowercase to track color
+                piece = "W" if color == "w" else "B"
             else:
-                max_diff = 40 + entropy * 15
+                piece = match_piece_in_cell(cell_img, piece_templates, color, cell_size)
 
-            print(f"Max difference threshold: {max_diff}")
-            logging.info(f"Max difference threshold: {max_diff}")
+            if playing_color == "b":
+                r, c = 7 - row, 7 - col
+            else:
+                r, c = row, col
+            board[r][c] = piece
+            piece_count += 1
 
-            if opponent_rating:
-                adjustment_factor = max(1, (opponent_rating / 2000))
-                if opponent_rating < 1800:
-                    adjustment_factor *= 0.8
-                elif opponent_rating > 2200:
-                    adjustment_factor *= 1.2
-                max_diff *= adjustment_factor
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(annotated, piece, (x1 + 5, y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            valid_moves = []
-            for move in analysis:
-                move_score = move["score"].relative.score()
-                if move_score is None:
-                    move_score = 0  # Default to neutral position
-                score_diff = abs(move_score - best_move_score)
-                if score_diff <= max_diff:
-                    valid_moves.append((move, score_diff))
-
-            print(f"Valid moves count: {len(valid_moves)}")
-            logging.info(f"Valid moves count: {len(valid_moves)}")
-
-            if not valid_moves:
-                return best_move, best_move_score, best_move_score
-
-            move_weights = []
-            for move, diff in valid_moves:
-                weight = (max_diff - diff) / max_diff
-                weight *= random.uniform(0.8, 1.2)
-                move_weights.append(weight)
-
-            print(f"Move weights: {move_weights}")
-            logging.info(f"Move weights: {move_weights}")
-
-            if random.random() < 0.1 and abs(position_advantage) < 1:
-                selected_move = random.choice(valid_moves)[0]
-                selected_score = selected_move["score"].relative.score()
-                if selected_score is None:
-                    selected_score = 0
-                print(
-                    f"Selected move: {selected_move['pv'][0]}, Score: {selected_score}"
-                )
-                print(f"Move rank: {analysis.index(selected_move) + 1}")
-                logging.info(
-                    f"Selected move: {selected_move['pv'][0]}, Score: {selected_score}"
-                )
-                logging.info(f"Move rank: {analysis.index(selected_move) + 1}")
-                return (
-                    selected_move["pv"][0],
-                    best_move_score,
-                    selected_score,
-                )
-
-            selected_move = random.choices(
-                [m[0] for m in valid_moves], weights=move_weights, k=1
-            )[0]
-            selected_score = selected_move["score"].relative.score()
-            if selected_score is None:
-                selected_score = 0
-
-            print(f"Selected move: {selected_move['pv'][0]}, Score: {selected_score}")
-            print(f"Move rank: {analysis.index(selected_move) + 1}")
-            logging.info(
-                f"Selected move: {selected_move['pv'][0]}, Score: {selected_score}"
-            )
-            logging.info(f"Move rank: {analysis.index(selected_move) + 1}")
-
-            # Calculate and display variable move time
-            base_time = random.uniform(1.5, 2.5)
-            complexity_factor = 1 + (min(entropy, 0.5) * 0.4)
-            position_factor = 1 + (min(abs(position_advantage), 2) * 0.15)
-            move_time = base_time * complexity_factor * position_factor
-            print(f"Variable move time: {move_time:.2f} seconds")
-            logging.info(f"Variable move time: {move_time:.2f} seconds")
-
-            if use_randomizer:
-                time.sleep(random.uniform(0.1, 0.5))
-
-            return (
-                selected_move["pv"][0],
-                best_move_score,
-                selected_score,
-            )
-
-        except Exception as e:
-            logging.error(f"Attempt {attempt + 1} - An error occurred: {e}")
-            if attempt < retries - 1:
-                try:
-                    engine = initialize_stockfish()
-                except Exception as e2:
-                    logging.error(f"Failed to reinitialize engine: {e2}")
-            time.sleep(0.5)
-
-    try:
-        legal_moves = list(board.legal_moves)
-        if legal_moves:
-            emergency_move = legal_moves[0]
-            logging.warning(f"Using emergency move: {emergency_move}")
-            return emergency_move, 0, 0  # Return neutral scores for emergency moves
-    except Exception as e:
-        logging.error(f"Emergency move selection failed: {e}")
-
-    return None, None, None
+    return board, annotated, piece_count
 
 
-def are_images_similar(image1_path, image2_path, threshold=0.1):
-    """Enhanced similarity check that's more tolerant of moving pieces"""
+# ─── Image Comparison ─────────────────────────────────────────────────────────
+
+def are_images_similar(image1_path, image2_path, threshold=0.05):
+    """Check if two screenshots are similar enough that the board hasn't changed."""
     image1 = cv2.imread(image1_path, cv2.IMREAD_GRAYSCALE)
     image2 = cv2.imread(image2_path, cv2.IMREAD_GRAYSCALE)
     if image1 is None or image2 is None:
         return False
     if image1.shape != image2.shape:
         return False
-
-    # Calculate both absolute difference and structural similarity
     diff = cv2.absdiff(image1, image2)
     non_zero_count = np.count_nonzero(diff)
     total_pixels = diff.size
-
-    # Calculate movement area
-    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # If we detect exactly one or two contoured areas (piece movement + possible highlight)
-    # and they're reasonable size for a piece, consider this a moving piece
-    is_piece_moving = False
-    if 1 <= len(contours) <= 2:
-        total_area = sum(cv2.contourArea(c) for c in contours)
-        avg_piece_area = (cell_width * cell_height) * 0.8  # Expected piece size
-        if total_area < avg_piece_area * 2:  # Allow for piece + trail
-            is_piece_moving = True
-
-    return (non_zero_count / total_pixels) < threshold or is_piece_moving
+    return (non_zero_count / total_pixels) < threshold
 
 
-def validate_move(prev_board, new_board, max_piece_diff=2):
+# ─── Stockfish Engine ─────────────────────────────────────────────────────────
+
+def initialize_stockfish():
+    """Find and initialize the Stockfish chess engine."""
+
+    def find_stockfish_exe():
+        # Check common Linux/Mac paths first (most likely for this user)
+        if platform.system() != "Windows":
+            for path in ["/usr/games/stockfish", "/usr/local/bin/stockfish",
+                         "/usr/bin/stockfish", "stockfish"]:
+                if os.path.exists(path):
+                    return path
+            # Try which
+            import shutil
+            found = shutil.which("stockfish")
+            if found:
+                return found
+        else:
+            # Windows: check known paths first
+            quick_paths = [
+                os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "Stockfish", "stockfish.exe"),
+                os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"), "Stockfish", "stockfish.exe"),
+                os.path.join(os.path.expanduser("~"), "Downloads", "stockfish.exe"),
+                "stockfish.exe",
+            ]
+            for path in quick_paths:
+                if os.path.exists(path):
+                    return path
+            # Search common directories for any stockfish executable
+            search_dirs = [
+                os.path.expanduser("~") + r"\Downloads",
+                os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            ]
+            for search_dir in search_dirs:
+                if not os.path.isdir(search_dir):
+                    continue
+                try:
+                    for root, dirs, files in os.walk(search_dir):
+                        for f in files:
+                            if f.lower().startswith("stockfish") and f.endswith(".exe"):
+                                return os.path.join(root, f)
+                        # Don't recurse too deep
+                        if root.count(os.sep) - search_dir.count(os.sep) > 3:
+                            dirs.clear()
+                except (PermissionError, OSError):
+                    continue
+            # Try PATH
+            found = shutil.which("stockfish")
+            if found:
+                return found
+        return None
+
+    stockfish_path = find_stockfish_exe()
+    if stockfish_path:
+        print(f"Found Stockfish at: {stockfish_path}")
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            engine.configure({
+                "Threads": config["threads"],
+                "Hash": config["hash_size"],
+            })
+            return engine
+        except Exception as e:
+            print(f"Error initializing Stockfish: {e}")
+
+    print("Stockfish not found automatically.")
+    user_path = input("Path to Stockfish (or 'skip'): ").strip()
+    if user_path.lower() == "skip":
+        print("Warning: Continuing without Stockfish.")
+        return None
+
+    if os.path.exists(user_path):
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(user_path)
+            engine.configure({
+                "Threads": config["threads"],
+                "Hash": config["hash_size"],
+            })
+            return engine
+        except Exception as e:
+            print(f"Error: {e}")
+    else:
+        print(f"Not found: {user_path}")
+    print("Continuing without Stockfish.")
+    return None
+
+
+# ─── Human-like Timing ────────────────────────────────────────────────────────
+
+def calculate_human_think_time(board, move, best_score, sel_score, move_number,
+                                piece_count, clock_remaining=None):
     """
-    Validates if the new board state is physically possible given the previous state.
-    Returns True if the move appears valid, False otherwise.
+    Calculate realistic human think time scaled to the clock.
+    Budget: use ~60-70% of remaining time over ~20 expected remaining moves.
+    Then vary based on position complexity and move type.
     """
-    if prev_board is None:
-        return True
+    # Budget-based max
+    if clock_remaining is not None and clock_remaining > 0:
+        estimated_moves_left = max(10, 40 - move_number)
+        budget = min((clock_remaining * 0.6) / estimated_moves_left, 12.0)
+    else:
+        budget = 8.0
 
-    # Count differences between boards
-    differences = 0
-    moved_from = []
-    moved_to = []
+    # Bimodal human timing: humans either play fast (intuition) or slow (calculation)
+    # Not a uniform distribution — it's two peaks
+    is_capture = board.is_capture(move)
+    is_check = board.gives_check(move)
+    legal_count = len(list(board.legal_moves))
 
-    for i in range(8):
-        for j in range(8):
-            if prev_board[i][j] != new_board[i][j]:
-                differences += 1
-                if prev_board[i][j] != "" and new_board[i][j] == "":
-                    moved_from.append((i, j))
-                elif prev_board[i][j] == "" and new_board[i][j] != "":
-                    moved_to.append((i, j))
+    # Decide: fast move or slow think?
+    fast_chance = 0.35  # Base 35% chance of fast/intuitive move
+    if is_capture and legal_count <= 5:
+        fast_chance = 0.85  # Forced recapture: almost always fast
+    elif is_capture:
+        fast_chance = 0.60  # Captures: often quick
+    elif is_check:
+        fast_chance = 0.70  # Giving check: usually pre-planned
+    elif legal_count <= 3:
+        fast_chance = 0.80  # Few options: quick decision
+    elif legal_count >= 30:
+        fast_chance = 0.15  # Many options: need to think
+    elif move_number <= 8:
+        fast_chance = 0.65  # Opening: theory, fast
 
-    # Basic validation checks
-    if differences > max_piece_diff:  # Too many pieces changed
-        return False
-    if len(moved_from) != len(moved_to):  # Unequal number of source/destination changes
-        return False
-    if differences == 0:  # No changes detected
-        return False
+    if random.random() < fast_chance:
+        # Fast move: 0.3-2.0s (intuition/premove/theory)
+        base = random.uniform(0.3, 2.0)
+    else:
+        # Slow think: 2.0-8.0s (calculation)
+        base = random.uniform(2.0, min(8.0, budget * 0.8))
 
-    # For each source-destination pair, verify it's a valid chess move
-    for src in moved_from:
-        for dst in moved_to:
-            # Calculate Manhattan distance
-            distance = abs(src[0] - dst[0]) + abs(src[1] - dst[1])
-            piece_type = prev_board[src[0]][src[1]].upper()
+    # Occasional very long think (3% — staring at a critical position)
+    if random.random() < 0.03 and (clock_remaining is None or clock_remaining > 120):
+        base = random.uniform(6.0, min(15.0, budget * 0.9))
 
-            # Validate based on piece type
-            if piece_type == "P":  # Pawn
-                if distance > 2:  # Pawns can't move more than 2 squares
-                    continue
-            elif piece_type in ["N"]:  # Knight
-                if distance != 3:  # Knights must move in L-shape
-                    continue
-            elif piece_type in ["B", "R", "Q", "K"]:  # Other pieces
-                if (
-                    piece_type == "K" and distance > 2
-                ):  # King can't move more than 1 square (2 for castling)
-                    continue
-            return True  # Found at least one valid move
+    # Occasional instant move (12% — premove or obvious recapture)
+    if random.random() < 0.12:
+        base = random.uniform(0.2, 0.8)
 
-    return False
+    # Clock pressure — hard overrides
+    if clock_remaining is not None:
+        if clock_remaining < 10:
+            base = min(base, random.uniform(0.1, 0.4))
+        elif clock_remaining < 30:
+            base = min(base, random.uniform(0.2, 1.0))
+        elif clock_remaining < 60:
+            base = min(base, random.uniform(0.4, 2.0))
+        elif clock_remaining < 120:
+            base = min(base, random.uniform(0.6, 3.0))
+
+    return max(0.2, min(base, budget))
 
 
-def check_win(board_image):
-    win_images = ["trophy.png", "crown.png"]
-    script_dir = os.path.dirname(os.path.realpath(__file__))
-    board_gray = cv2.cvtColor(board_image, cv2.COLOR_BGR2GRAY)
-    for win_image_name in win_images:
-        # Check multiple possible locations
-        possible_paths = [
-            win_image_name,
-            os.path.join(script_dir, win_image_name),
-            os.path.join(os.getcwd(), win_image_name)
-        ]
-        
-        for win_image_path in possible_paths:
-            if os.path.exists(win_image_path):
-                win_image = cv2.imread(win_image_path, cv2.IMREAD_UNCHANGED)
-                if win_image is not None:
-                    win_gray = cv2.cvtColor(win_image, cv2.COLOR_BGR2GRAY)
-                    res = cv2.matchTemplate(board_gray, win_gray, cv2.TM_CCOEFF_NORMED)
-                    threshold = 0.8
-                    loc = np.where(res >= threshold)
-                    if len(loc[0]) > 0:
+def get_clock_remaining(selenium_ctrl):
+    """Try to read the player's clock from chess.com via Selenium."""
+    if not selenium_ctrl or not selenium_ctrl.is_alive():
+        return None
+    try:
+        from selenium.webdriver.common.by import By
+        # Chess.com clock selectors (bottom clock = our clock)
+        for sel in ['.clock-bottom', '.clock-player-turn',
+                    '[data-cy="clock-bottom"]', '.clock-component.clock-bottom']:
+            elems = selenium_ctrl.driver.find_elements(By.CSS_SELECTOR, sel)
+            for elem in elems:
+                if elem.is_displayed():
+                    text = elem.text.strip()
+                    # Parse "5:00" or "1:23.4" or "0:45"
+                    parts = text.replace('.', ':').split(':')
+                    if len(parts) >= 2:
+                        try:
+                            mins = int(parts[0])
+                            secs = int(parts[1])
+                            return mins * 60 + secs
+                        except ValueError:
+                            pass
+    except Exception:
+        pass
+    return None
+
+
+# ─── Opening Book ─────────────────────────────────────────────────────────────
+
+# Common openings — plays these from memory (no engine) for the first few moves.
+# This is undetectable because it's exactly what humans do.
+OPENING_BOOK = {
+    # As White
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR": [
+        "e2e4", "d2d4", "c2c4", "g1f3",
+    ],
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR": [  # After 1.e4
+        "g1f3", "d2d4", "f1c4", "b1c3",
+    ],
+    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR": [  # After 1.d4
+        "c2c4", "g1f3", "c1f4", "b1c3",
+    ],
+    # As Black vs 1.e4
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR": [
+        "e7e5", "c7c5", "e7e6", "c7c6", "d7d5",
+    ],
+    # As Black vs 1.d4
+    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR": [
+        "d7d5", "g8f6", "e7e6", "f7f5",
+    ],
+    # As Black vs 1.c4
+    "rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR": [
+        "e7e5", "g8f6", "c7c5", "e7e6",
+    ],
+    # As Black vs 1.Nf3
+    "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R": [
+        "d7d5", "g8f6", "c7c5",
+    ],
+}
+
+
+def get_book_move(board):
+    """Try to get a move from the opening book. Returns move or None."""
+    # Use book for up to 12 moves (24 half-moves)
+    if len(board.move_stack) > 24:
+        return None
+    # Gradually reduce book usage: 100% at move 1, ~50% at move 8, ~20% at move 12
+    book_chance = max(0.15, 1.0 - len(board.move_stack) * 0.035)
+    if random.random() > book_chance:
+        return None
+
+    # Get position key (just the piece placement, ignore castling/en passant)
+    fen_parts = board.fen().split()
+    position = fen_parts[0]
+
+    candidates = OPENING_BOOK.get(position, [])
+    if not candidates:
+        return None
+
+    # Filter to legal moves
+    legal = []
+    for uci in candidates:
+        try:
+            move = chess.Move.from_uci(uci)
+            if board.is_legal(move):
+                legal.append(move)
+        except Exception:
+            pass
+
+    if legal:
+        return random.choice(legal)
+    return None
+
+
+# ─── Move Analysis ────────────────────────────────────────────────────────────
+
+def get_best_move(engine, board, piece_count, use_randomizer, skill_level,
+                  opponent_rating=None, opp_avg_cpl=None, retries=3):
+    """
+    Analyze position and select a move with anti-detection mechanics.
+    Uses the python-chess Board directly for accurate position info.
+    """
+    for attempt in range(retries):
+        try:
+            # Adaptive depth with occasional shallow analysis (creates natural errors)
+            # 12% chance of "lazy" analysis — humans don't always calculate deeply
+            if random.random() < 0.12:
+                base_depth = random.randint(4, 8)
+                min_depth = 4
+            elif piece_count <= 16:
+                base_depth = random.randint(12, 18)
+                min_depth = 12
+            elif piece_count <= 25:
+                base_depth = random.randint(10, 16)
+                min_depth = 10
+            else:
+                base_depth = random.randint(10, 14)
+                min_depth = 10
+
+            entropy = 0.3
+
+            # Quick analysis for critical position detection + entropy
+            try:
+                quick = engine.analyse(board, chess.engine.Limit(depth=10), multipv=3)
+                scores = [m["score"].relative.score() for m in quick
+                          if m["score"].relative.score() is not None]
+                if scores:
+                    if max(abs(s) for s in scores) > 150:
+                        base_depth = max(base_depth, 20)
+                    entropy = (max(scores) - min(scores)) / 100
+            except Exception as e:
+                logging.error(f"Quick analysis failed: {e}")
+
+            depth = min(max(base_depth + (1 if entropy > 0.3 else 0), min_depth),
+                        config["max_depth"])
+
+            logging.info(f"Analysis depth={depth}, entropy={entropy:.2f}")
+
+            try:
+                analysis = engine.analyse(
+                    board, chess.engine.Limit(depth=depth),
+                    multipv=5, options={"Skill Level": skill_level},
+                )
+            except Exception:
+                analysis = engine.analyse(
+                    board, chess.engine.Limit(time=2.0 if piece_count <= 16 else 1.0),
+                    multipv=5, options={"Skill Level": skill_level},
+                )
+
+            if not analysis:
+                raise Exception("No analysis returned")
+
+            best_move = analysis[0]["pv"][0]
+            best_score = analysis[0]["score"].relative.score() or 0
+
+            if not best_move or not board.is_legal(best_move):
+                raise Exception("Invalid move generated")
+
+            # Select from top moves — much wider window for human-like play
+            advantage = best_score / 100
+            move_num = len(board.move_stack) // 2 + 1
+
+            # Base window: 100-200cp (humans regularly play 1-2 pawn suboptimal)
+            if abs(advantage) > 3.0:
+                max_diff = 120 + abs(advantage) * 10  # Winning big → more slack
+            elif abs(advantage) > 1.5:
+                max_diff = 100 + abs(advantage) * 8
+            else:
+                max_diff = 80 + entropy * 25
+
+            # Opponent-adaptive: match ~70% of their CPL
+            if opp_avg_cpl is not None and opp_avg_cpl > 30:
+                target_cpl = opp_avg_cpl * 0.7
+                max_diff = max(max_diff, target_cpl * 2.0)
+                max_diff = min(max_diff, 300)
+
+            # Fatigue: window widens as game goes on
+            if move_num > 20:
+                max_diff *= 1.0 + (move_num - 20) * 0.02
+
+            valid_moves = []
+            for m in analysis:
+                ms = m["score"].relative.score() or 0
+                diff = abs(ms - best_score)
+                if diff <= max_diff:
+                    valid_moves.append((m, diff))
+
+            if not valid_moves:
+                return best_move, best_score, best_score
+
+            # Blunder injection — realistic rates
+            blunder_chance = 0.06  # Base 6% (humans blunder often)
+            if move_num > 20:
+                blunder_chance += (move_num - 20) * 0.008  # +0.8% per move after 20
+            if advantage > 2.0:
+                blunder_chance += 0.06  # Overconfidence when winning
+            if advantage < -2.0:
+                blunder_chance += 0.04  # Desperation when losing
+
+            if use_randomizer and random.random() < min(blunder_chance, 0.25):
+                # Pick a "human-like" blunder: prefer captures and checks
+                # (humans blunder into tactics, not random squares)
+                all_legal = list(board.legal_moves)
+                non_best = [m for m in all_legal if m != best_move]
+                if non_best:
+                    # Weight toward captures/checks (humans blunder tactically)
+                    blunder_candidates = []
+                    for m in non_best:
+                        w = 1.0
+                        if board.is_capture(m):
+                            w = 3.0  # Captures look tempting
+                        if board.gives_check(m):
+                            w = 2.5  # Checks feel aggressive
+                        blunder_candidates.append((m, w))
+                    blunder_weights = [w for _, w in blunder_candidates]
+                    blunder = random.choices([m for m, _ in blunder_candidates],
+                                             weights=blunder_weights, k=1)[0]
+                    logging.info(f"Blunder injected: {blunder}")
+                    return blunder, best_score, best_score - 100
+
+            # Exponential weighting (not linear) — makes best move less dominant
+            # Linear: best=1.0, 50cp=0.5, 100cp=0 → best wins 2:1
+            # Exponential: best=1.0, 50cp=0.37, 100cp=0.13 → more spread
+            import math
+            decay = 0.015  # Lower = more spread, higher = more concentrated
+            weights = [math.exp(-decay * d) * random.uniform(0.7, 1.3)
+                       for _, d in valid_moves]
+
+            # 20% chance of random pick in equal positions (was 10%)
+            if random.random() < 0.20 and abs(advantage) < 1.5:
+                sel = random.choice(valid_moves)[0]
+            else:
+                sel = random.choices([m for m, _ in valid_moves], weights=weights, k=1)[0]
+
+            sel_score = sel["score"].relative.score() or 0
+            sel_move = sel["pv"][0]
+
+            rank = analysis.index(sel) + 1
+            logging.info(f"Selected: {sel_move} (rank {rank}, score {sel_score})")
+
+            return sel_move, best_score, sel_score
+
+        except Exception as e:
+            logging.error(f"Analysis attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                try:
+                    engine = initialize_stockfish()
+                except Exception:
+                    pass
+            time.sleep(0.5)
+
+    # Emergency: pick first legal move
+    legal = list(board.legal_moves)
+    if legal:
+        logging.warning(f"Emergency move: {legal[0]}")
+        return legal[0], 0, 0
+    return None, None, None
+
+
+# ─── Move Display ─────────────────────────────────────────────────────────────
+
+def format_move(move, board):
+    """Format a move for display with piece name and squares."""
+    piece = board.piece_at(move.from_square)
+    piece_name = ""
+    if piece:
+        names = {"P": "Pawn", "N": "Knight", "B": "Bishop",
+                 "R": "Rook", "Q": "Queen", "K": "King"}
+        piece_name = names.get(piece.symbol().upper(), "")
+
+    src = chess.SQUARE_NAMES[move.from_square]
+    dst = chess.SQUARE_NAMES[move.to_square]
+    promo = ""
+    if move.promotion:
+        promo_names = {chess.QUEEN: "Q", chess.ROOK: "R",
+                       chess.BISHOP: "B", chess.KNIGHT: "N"}
+        promo = f" (promote to {promo_names.get(move.promotion, '?')})"
+
+    return f"\033[1m\033[92m▶ {piece_name} {src} → {dst}{promo}\033[0m"
+
+
+def format_eval(score):
+    """Format an engine evaluation score."""
+    if score is None:
+        return "?"
+    pawns = score / 100
+    if pawns > 0:
+        return f"\033[92m+{pawns:.1f}\033[0m"
+    elif pawns < 0:
+        return f"\033[91m{pawns:.1f}\033[0m"
+    return "0.0"
+
+
+def print_status(game_state, move=None, score=None):
+    """Print a compact status line."""
+    stage = game_state.game_stage
+    pieces = game_state.piece_count
+    move_num = len(game_state.move_history) // 2 + 1
+    turn = "White" if game_state.board.turn == chess.WHITE else "Black"
+
+    parts = [f"Move {move_num}", f"{turn} to play", f"{stage} ({pieces} pcs)"]
+    if score is not None:
+        parts.append(f"eval: {format_eval(score)}")
+
+    print(f"\033[90m{'  |  '.join(parts)}\033[0m")
+    if move:
+        print(format_move(move, game_state.board))
+
+
+# ─── Skill Adjustment ─────────────────────────────────────────────────────────
+
+def adjust_skill_level(engine, current_skill, piece_count, score_diff, game=None):
+    """Dynamically adjust skill level to play slightly above opponent's level.
+    Uses opponent's average CPL to estimate their ELO and match it."""
+    min_skill = 5
+
+    # Estimate target skill from opponent's play quality
+    target_skill = current_skill
+    if game and hasattr(game, '_opp_cpls') and len(game._opp_cpls) >= 3:
+        avg_cpl = sum(game._opp_cpls) / len(game._opp_cpls)
+        # Map opponent CPL to our skill level (play slightly better)
+        # CPL 10-20 = engine (~2500 ELO) → skill 20
+        # CPL 30-50 = strong player (~1800) → skill 16-18
+        # CPL 50-80 = average player (~1400) → skill 12-15
+        # CPL 80-120 = weak player (~1000) → skill 8-12
+        # CPL 120+ = beginner → skill 5-8
+        if avg_cpl < 20:
+            target_skill = 20  # They're engine-level, play max
+        elif avg_cpl < 40:
+            target_skill = random.randint(17, 20)
+        elif avg_cpl < 60:
+            target_skill = random.randint(14, 18)
+        elif avg_cpl < 90:
+            target_skill = random.randint(11, 15)
+        elif avg_cpl < 130:
+            target_skill = random.randint(8, 13)
+        else:
+            target_skill = random.randint(min_skill, 10)
+
+    # Drift toward target (faster: ±2 per move)
+    diff_to_target = target_skill - current_skill
+    if abs(diff_to_target) > 3:
+        step = random.randint(2, 3) * (1 if diff_to_target > 0 else -1)
+    elif abs(diff_to_target) > 0:
+        step = random.randint(1, 2) * (1 if diff_to_target > 0 else -1)
+    else:
+        step = 0
+    new_skill = current_skill + step
+
+    # Random variation (human-like inconsistency, 20% chance)
+    if random.random() < 0.20:
+        new_skill += random.choice([-3, -2, -1, 1, 2, 3])
+
+    new_skill = max(min_skill, min(20, new_skill))
+
+    if new_skill != current_skill:
+        engine.configure({"Skill Level": new_skill})
+        logging.info(f"Skill level: {current_skill} → {new_skill} (opp target: {target_skill})")
+
+    return new_skill
+
+
+# ─── Win/Loss Detection ──────────────────────────────────────────────────────
+
+def check_win(image):
+    """Check for win indicators (trophy, crown) in the image."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    for name in ["trophy.png", "crown.png"]:
+        path = os.path.join(SCRIPT_DIR, name)
+        if os.path.exists(path):
+            tmpl = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if tmpl is not None:
+                tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+                for scale in [0.75, 1.0, 1.25]:
+                    th, tw = tmpl_gray.shape
+                    sw, sh = int(tw * scale), int(th * scale)
+                    if sw < 10 or sh < 10 or sw > gray.shape[1] or sh > gray.shape[0]:
+                        continue
+                    scaled = cv2.resize(tmpl_gray, (sw, sh))
+                    res = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
+                    if np.max(res) >= 0.82:
                         return True
     return False
 
+
+# ─── Auto-Move (click pieces on screen) ──────────────────────────────────────
+
+def get_square_screen_coords(square, board_bounds, playing_color):
+    """
+    Get the screen pixel coordinates for the center of a chess square.
+    square: chess.Square (0-63)
+    """
+    bx, by, bw, bh = board_bounds
+    cell_w = bw / 8
+    cell_h = bh / 8
+
+    file = chess.square_file(square)  # 0=a, 7=h
+    rank = chess.square_rank(square)  # 0=1, 7=8
+
+    if playing_color == "w":
+        col = file
+        row = 7 - rank
+    else:
+        col = 7 - file
+        row = rank
+
+    x = int(bx + col * cell_w + cell_w / 2)
+    y = int(by + row * cell_h + cell_h / 2)
+    return x, y
+
+
+class SeleniumController:
+    """Controls chess.com via Selenium — clicks squares directly in the browser DOM."""
+
+    def __init__(self):
+        self.driver = None
+        self.board_elem = None
+        self.ready = False  # True once user is logged in and game page is loaded
+
+    def launch(self, game_mode=None, playing_color="w"):
+        """Launch a Selenium-controlled Firefox and open chess.com."""
+        from selenium import webdriver
+        from selenium.webdriver.firefox.options import Options
+        from selenium.webdriver.firefox.service import Service
+
+        opts = Options()
+        if platform.system() == "Windows":
+            browser_paths = [
+                os.path.join(os.environ.get("PROGRAMFILES", ""), "Mozilla Firefox", "firefox.exe"),
+                os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Mozilla Firefox", "firefox.exe"),
+                os.path.join(os.path.expanduser("~"), "AppData", "Local", "Mozilla Firefox", "firefox.exe"),
+            ]
+            gecko_candidates = [
+                os.path.join(os.path.expanduser("~"), "Downloads", "geckodriver.exe"),
+                "geckodriver.exe",
+            ]
+        else:
+            browser_paths = [
+                '/snap/firefox/current/usr/lib/firefox/firefox',
+                '/usr/bin/firefox', '/usr/lib/firefox/firefox',
+            ]
+            gecko_candidates = [
+                '/snap/bin/geckodriver', '/usr/bin/geckodriver',
+                '/usr/local/bin/geckodriver',
+            ]
+
+        for binary in browser_paths:
+            if os.path.exists(binary):
+                opts.binary_location = binary
+                break
+
+        import shutil
+        gecko = next((p for p in gecko_candidates if os.path.exists(p)), None)
+        if gecko is None:
+            gecko = shutil.which("geckodriver")
+        if gecko:
+            service = Service(executable_path=gecko)
+        else:
+            service = Service()
+
+        # Anti-fingerprinting: comprehensive stealth
+        opts.set_preference("dom.webdriver.enabled", False)
+        opts.set_preference("useAutomationExtension", False)
+        opts.set_preference("dom.disable_window_move_resize", False)
+        opts.set_preference("general.useragent.override", "")  # Use default UA
+        # Disable WebRTC leak (reveals real IP behind VPN)
+        opts.set_preference("media.peerconnection.enabled", False)
+        # Normal browser behavior
+        opts.set_preference("dom.popup_maximum", 10)
+        opts.set_preference("privacy.trackingprotection.enabled", True)
+
+        self.driver = webdriver.Firefox(options=opts, service=service)
+
+        # Remove all automation fingerprints from navigator
+        self.driver.execute_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            window.chrome = {runtime: {}};
+            delete window.__fxdriver_unwrapped;
+        """)
+
+        # Position browser on the left half of the screen
+        self._tile_left()
+
+        print(f"\033[92mBrowser opened:\033[0m chess.com")
+
+        if game_mode == "player":
+            # Login flow first — no popup dismissal until logged in
+            self._wait_for_login_and_play()
+            self.ready = True
+        elif game_mode == "bot":
+            self.driver.get('https://www.chess.com/play/computer')
+            time.sleep(4)
+            self.dismiss_popups()
+            self._start_bot_game(playing_color)
+            self.ready = True
+        elif game_mode == "watch":
+            # Watch mode: just open chess.com, user sets up the game
+            self.driver.get('https://www.chess.com')
+            time.sleep(3)
+            self.dismiss_popups()
+            print("\033[92mWatch mode:\033[0m waiting for a game to appear on screen...")
+            self.ready = True
+        else:
+            self.driver.get('https://www.chess.com')
+            time.sleep(4)
+            self.dismiss_popups()
+            self.ready = True
+
+        return True
+
+    def _start_bot_game(self, playing_color):
+        """Auto-start a bot game on chess.com."""
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        try:
+            # Click "Play" or "Start" button if present
+            for selector in ['button[data-cy="play-button"]',
+                             'a[href*="play/computer"]',
+                             'button.cc-button-primary',
+                             'button.ui_v5-button-primary']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elems:
+                    if elem.is_displayed():
+                        elem.click()
+                        time.sleep(2)
+                        self.dismiss_popups()
+                        break
+
+            # Choose color if there's a color selector
+            if playing_color == "b":
+                for selector in ['[data-cy="black-button"]', 'button[title="Black"]',
+                                 '.selection-menu-button-black']:
+                    elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for elem in elems:
+                        if elem.is_displayed():
+                            elem.click()
+                            time.sleep(1)
+                            break
+
+            # Click Play/Start
+            time.sleep(1)
+            self.dismiss_popups()
+            for selector in ['button[data-cy="play-button"]',
+                             'button.cc-button-primary',
+                             'button.ui_v5-button-primary',
+                             'button.ui_v5-button-large']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elems:
+                    try:
+                        text = elem.text.lower()
+                        if elem.is_displayed() and ('play' in text or 'start' in text or 'choose' in text):
+                            elem.click()
+                            time.sleep(2)
+                            self.dismiss_popups()
+                            print("\033[92mGame started!\033[0m")
+                            return
+                    except Exception:
+                        pass
+
+            print("Set up your game in the browser, the assistant will detect it automatically.")
+        except Exception as e:
+            logging.error(f"Auto-start bot game failed: {e}")
+            print("Set up your game in the browser manually.")
+
+    def _import_cookies_from_firefox(self):
+        """Import login cookies from the user's real Firefox profile."""
+        import sqlite3, glob
+
+        profile_dirs = [
+            os.path.expanduser("~/.mozilla/firefox"),
+            os.path.expanduser("~/snap/firefox/common/.mozilla/firefox"),
+        ]
+
+        for base in profile_dirs:
+            for profile in glob.glob(os.path.join(base, "*.default*")):
+                cookie_db = os.path.join(profile, "cookies.sqlite")
+                if not os.path.exists(cookie_db):
+                    continue
+                try:
+                    # Copy the DB (Firefox locks it while running)
+                    import shutil
+                    tmp_db = os.path.join(tempfile.gettempdir(), "chess_cookies.sqlite")
+                    shutil.copy2(cookie_db, tmp_db)
+
+                    conn = sqlite3.connect(tmp_db)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT name, value, host, path, isSecure FROM moz_cookies WHERE host LIKE '%chess.com%'")
+                    cookies = cursor.fetchall()
+                    conn.close()
+                    os.remove(tmp_db)
+
+                    if cookies:
+                        # Navigate to chess.com first (cookies need matching domain)
+                        self.driver.get('https://www.chess.com')
+                        time.sleep(2)
+                        imported = 0
+                        for name, value, host, path, secure in cookies:
+                            try:
+                                self.driver.add_cookie({
+                                    'name': name,
+                                    'value': value,
+                                    'domain': host,
+                                    'path': path,
+                                    'secure': bool(secure),
+                                })
+                                imported += 1
+                            except Exception:
+                                pass
+                        if imported > 0:
+                            logging.info(f"Imported {imported} cookies from Firefox profile")
+                            return True
+                except Exception as e:
+                    logging.error(f"Cookie import failed: {e}")
+        return False
+
+    def _wait_for_login_and_play(self):
+        """Try cookie import first, fall back to manual login."""
+        # Try to import cookies from real Firefox
+        if self._import_cookies_from_firefox():
+            self.driver.get('https://www.chess.com/home')
+            time.sleep(3)
+            url = self.driver.current_url
+            if 'login' not in url.lower():
+                print("\033[92mLogged in via cookies!\033[0m")
+                self.driver.get('https://www.chess.com/play/online')
+                time.sleep(3)
+                self.dismiss_popups()
+                return
+            print("\033[93mCookies expired, need fresh login.\033[0m")
+
+        # Fall back: open login page and wait
+        self.driver.get('https://www.chess.com/login')
+        time.sleep(2)
+
+        url = self.driver.current_url
+        if 'login' not in url.split('?')[0]:
+            print("\033[92mAlready logged in!\033[0m")
+            self.driver.get('https://www.chess.com/play/online')
+            time.sleep(3)
+            self.dismiss_popups()
+            return
+
+        print("\033[93mPlease log in to chess.com in the browser...\033[0m")
+        print("\033[90m  (If Cloudflare blocks login here, log in on your normal Firefox first,\033[0m")
+        print("\033[90m   then restart the assistant — it will import your cookies.)\033[0m")
+        while True:
+            time.sleep(2)
+            try:
+                url = self.driver.current_url
+                if 'login' not in url.split('?')[0]:
+                    print("\033[92mLogged in!\033[0m Navigating to play...")
+                    self.driver.get('https://www.chess.com/play/online')
+                    time.sleep(3)
+                    self.dismiss_popups()
+                    return
+            except Exception:
+                pass
+
+    def dismiss_popups(self):
+        """Auto-dismiss chess.com popups, modals, cookie banners, etc.
+        Skips login/signup forms so user can authenticate."""
+        from selenium.webdriver.common.by import By
+
+        # Check if a login/signup form is visible — don't dismiss it
+        login_selectors = ['form[action*="login"]', '#login', '.login-modal',
+                           'input[name="username"]', 'input[name="password"]',
+                           '[data-cy="login-form"]', '.auth-modal']
+        for sel in login_selectors:
+            try:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                if any(e.is_displayed() for e in elems):
+                    return  # Login form visible — don't dismiss anything
+            except Exception:
+                pass
+
+        popup_selectors = [
+            # "Play the bots" modal start button
+            'button.cc-button-primary',
+            # Generic modal close buttons (but NOT on login pages)
+            '.modal-close-icon', '.ui_outside-close-icon',
+            '[data-cy="modal-close"]',
+            # Close X buttons on overlays
+            '[aria-label="Close"]', '[aria-label="close"]',
+            # Cookie consent
+            '#onetrust-accept-btn-handler',
+            '[id*="cookie"] button', '[class*="cookie"] button',
+            # "Got it" / "OK" / "No thanks" buttons in modals
+            '.modal-content button.primary',
+            # Chess.com specific overlays
+            '.modal-game-over-button', '.modal-first-time-button',
+            # Premium/upsell popups
+            '[class*="promo"] [aria-label="Close"]',
+            '[class*="upgrade"] [aria-label="Close"]',
+            '[class*="popup"] [aria-label="Close"]',
+        ]
+        dismissed = 0
+        for selector in popup_selectors:
+            try:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elems:
+                    if elem.is_displayed():
+                        # Skip if it's inside a login/auth context
+                        try:
+                            parent_html = elem.find_element(By.XPATH, './ancestor::div[contains(@class,"login") or contains(@class,"auth") or contains(@class,"signup")]')
+                            continue  # Inside login form
+                        except Exception:
+                            pass
+                        elem.click()
+                        dismissed += 1
+                        time.sleep(0.5)
+            except Exception:
+                pass
+
+        # Also look for "No thanks" / "Not now" / "Maybe later" buttons (upsell dismissal)
+        try:
+            for elem in self.driver.find_elements(By.CSS_SELECTOR, 'button, a, span'):
+                try:
+                    if not elem.is_displayed():
+                        continue
+                    text = elem.text.strip().lower()
+                    if text in ['no thanks', 'not now', 'maybe later', 'dismiss',
+                                'no, thanks', 'skip', 'close', 'x']:
+                        elem.click()
+                        dismissed += 1
+                        time.sleep(0.3)
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if dismissed:
+            logging.info(f"Dismissed {dismissed} popups")
+
+    def _tile_left(self):
+        """Tile browser to the left half."""
+        try:
+            screen_w = self.driver.execute_script("return screen.width")
+            screen_h = self.driver.execute_script("return screen.height")
+            self.driver.set_window_rect(x=0, y=0, width=screen_w // 2, height=screen_h)
+        except Exception:
+            pass
+        print("\033[90m  Tip: press Super+Left to snap browser to left half\033[0m")
+
+    def _find_board(self):
+        """Find the chess board element in the page."""
+        from selenium.webdriver.common.by import By
+        try:
+            for selector in ['wc-chess-board', '.board', '#board-layout-chessboard',
+                             '[id*="board"]', '.chess-board']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if elems:
+                    self.board_elem = elems[0]
+                    return self.board_elem
+        except Exception:
+            pass
+        return None
+
+    def click_square(self, square, playing_color):
+        """Click a chess square with human-like mouse movement.
+        Uses Bezier curves, acceleration/deceleration, and natural overshoot."""
+        from selenium.webdriver.common.action_chains import ActionChains
+        import math
+
+        board = self._find_board()
+        if not board:
+            logging.error("Selenium: board element not found")
+            return False
+
+        size = board.size
+        bw, bh = size['width'], size['height']
+        cell_w = bw / 8
+        cell_h = bh / 8
+
+        file = chess.square_file(square)
+        rank = chess.square_rank(square)
+
+        if playing_color == "w":
+            col = file
+            row = 7 - rank
+        else:
+            col = 7 - file
+            row = rank
+
+        # Target with gaussian inaccuracy (humans miss center by ~8-15%)
+        spread = cell_w * random.uniform(0.08, 0.15)
+        target_x = col * cell_w + cell_w / 2 + random.gauss(0, spread)
+        target_y = row * cell_h + cell_h / 2 + random.gauss(0, spread)
+
+        # Offset from board center (ActionChains reference point)
+        tx = target_x - bw / 2
+        ty = target_y - bh / 2
+
+        actions = ActionChains(self.driver)
+
+        # Bezier curve control point — creates a natural arc
+        # Humans don't move in straight lines, they curve slightly
+        arc_strength = random.uniform(0.1, 0.3)
+        ctrl_x = tx * 0.5 + random.gauss(0, abs(tx) * arc_strength + 5)
+        ctrl_y = ty * 0.5 + random.gauss(0, abs(ty) * arc_strength + 5)
+
+        # Number of steps — more for longer distances
+        dist = math.sqrt(tx * tx + ty * ty)
+        steps = max(3, min(8, int(dist / 30) + random.randint(2, 4)))
+
+        for i in range(steps):
+            # Ease-in-out timing (slow start, fast middle, slow end)
+            t = (i + 1) / steps
+            ease = t * t * (3 - 2 * t)  # Smoothstep
+
+            # Quadratic Bezier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+            # P0 = (0,0), P1 = control, P2 = target
+            bx = 2 * (1 - ease) * ease * ctrl_x + ease * ease * tx
+            by = 2 * (1 - ease) * ease * ctrl_y + ease * ease * ty
+
+            # Add micro-jitter (hand tremor) — random, not perfectly linear
+            tremor = random.uniform(0, 2.5) * (1 - ease * 0.7)
+            bx += random.gauss(0, tremor)
+            by += random.gauss(0, tremor)
+
+            actions.move_to_element_with_offset(board, bx, by)
+
+            # Variable timing — faster in middle, slower at start/end
+            if i == 0:
+                actions.pause(random.uniform(0.02, 0.06))  # Slow start
+            elif i == steps - 1:
+                actions.pause(random.uniform(0.01, 0.04))  # Approach
+            else:
+                actions.pause(random.uniform(0.005, 0.02))  # Fast middle
+
+        # Small overshoot + correction (20% of the time)
+        if random.random() < 0.2:
+            overshoot = random.uniform(2, 6)
+            ox = tx + random.choice([-1, 1]) * overshoot
+            oy = ty + random.choice([-1, 1]) * overshoot
+            actions.move_to_element_with_offset(board, ox, oy)
+            actions.pause(random.uniform(0.03, 0.08))
+
+        # Final position
+        actions.move_to_element_with_offset(board, tx, ty)
+        actions.pause(random.uniform(0.01, 0.06))
+        actions.click()
+        actions.perform()
+        return True
+
+    def execute_move(self, move, playing_color):
+        """Execute a chess move by clicking source then destination square."""
+        try:
+            # Simulate network latency (50-200ms)
+            time.sleep(random.uniform(0.05, 0.20))
+
+            self.click_square(move.from_square, playing_color)
+            # Human pause between source and destination click
+            # Varies: fast drag-like (0.05s) to deliberate click-click (0.3s)
+            time.sleep(random.choice([
+                random.uniform(0.05, 0.12),   # Fast (drag-like)
+                random.uniform(0.10, 0.25),   # Normal
+                random.uniform(0.20, 0.40),   # Deliberate
+            ]))
+            self.click_square(move.to_square, playing_color)
+
+            if move.promotion:
+                time.sleep(0.3)
+                # Chess.com shows promotion picker — queen is at the same spot
+                if move.promotion == chess.QUEEN:
+                    self.click_square(move.to_square, playing_color)
+                elif move.promotion == chess.KNIGHT:
+                    # Knight is one square below queen in the picker
+                    from selenium.webdriver.common.action_chains import ActionChains
+                    board = self._find_board()
+                    if board:
+                        cell_h = board.size['height'] / 8
+                        ActionChains(self.driver).move_by_offset(0, cell_h).click().perform()
+
+            logging.info(f"Selenium auto-moved: {move.uci()}")
+            return True
+        except Exception as e:
+            logging.error(f"Selenium auto-move failed: {e}")
+            return False
+
+    def detect_game_over(self):
+        """Check if chess.com is showing a game-over modal.
+        Returns (is_over, result_text) e.g. (True, 'White Won by checkmate')."""
+        from selenium.webdriver.common.by import By
+        game_over_words = ['won', 'lost', 'draw', 'stalemate', 'timeout',
+                           'resign', 'checkmate', 'time', 'abort', 'game over',
+                           'game aborted', 'victory', 'defeat', 'abandoned',
+                           'white won', 'black won', 'game review']
+        try:
+            # Quick check: "Game Review" button is the most reliable signal
+            # It ONLY appears after a game ends
+            for sel in ['button', 'a', '[class*="review"]']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for elem in elems:
+                    try:
+                        if elem.is_displayed() and 'game review' in elem.text.strip().lower():
+                            # Found game review — get the result text from nearby elements
+                            result = self._get_game_result_text()
+                            return True, result or "Game ended"
+                    except Exception:
+                        pass
+
+            # Check known modal selectors
+            for sel in ['.game-over-modal', '.modal-game-over',
+                        '[data-cy="game-over-modal"]', '.board-modal-container',
+                        '.modal-container', '.board-modal-overlay',
+                        '[class*="game-over"]', '[class*="modal"]']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for elem in elems:
+                    try:
+                        if elem.is_displayed():
+                            text = elem.text.strip()
+                            if any(w in text.lower() for w in game_over_words):
+                                return True, text.split('\n')[0]
+                    except Exception:
+                        pass
+
+            # Check headings only (not all spans/divs — too many false positives)
+            for sel in ['h1', 'h2', 'h3']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for elem in elems:
+                    try:
+                        if not elem.is_displayed():
+                            continue
+                        text = elem.text.strip().lower()
+                        if len(text) > 50:
+                            continue
+                        # Require more specific phrases, not just "won"
+                        if any(w in text for w in ['white won', 'black won', 'checkmate',
+                                                    'game aborted', 'game over',
+                                                    'victory', 'defeat', 'you won']):
+                            return True, elem.text.strip()
+                    except Exception:
+                        pass
+
+            # Check for "New game" buttons
+            for sel in ['button', 'a']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for elem in elems:
+                    try:
+                        if elem.is_displayed():
+                            text = elem.text.strip().lower()
+                            if text.startswith('new ') and ('min' in text or 'game' in text):
+                                return True, "Game ended"
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False, ""
+
+    def _get_game_result_text(self):
+        """Extract the game result text from the page."""
+        from selenium.webdriver.common.by import By
+        try:
+            for sel in ['h1', 'h2', 'h3', 'h4', '[class*="header"]',
+                        '[class*="result"]', '[class*="title"]']:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for elem in elems:
+                    try:
+                        if elem.is_displayed():
+                            text = elem.text.strip()
+                            if any(w in text.lower() for w in ['won', 'lost', 'draw',
+                                                                'checkmate', 'time',
+                                                                'resign', 'abort']):
+                                return text
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return ""
+
+    def start_new_game(self):
+        """Start a new game. Navigates directly to play page."""
+        try:
+            # Use JS navigation (non-blocking, won't timeout)
+            try:
+                self.driver.execute_script("window.location.href = 'https://www.chess.com/play/online'")
+            except Exception:
+                # JS failed, try direct navigation with short timeout
+                try:
+                    self.driver.set_page_load_timeout(10)
+                    self.driver.get('https://www.chess.com/play/online')
+                except Exception:
+                    try:
+                        self.driver.execute_script("window.stop()")
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        self.driver.set_page_load_timeout(120)
+                    except Exception:
+                        pass
+
+            time.sleep(5)
+            self.dismiss_popups()
+
+            # Click any play/start button
+            from selenium.webdriver.common.by import By
+            for attempt in range(3):
+                for sel in ['button', 'a']:
+                    for elem in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        try:
+                            if not elem.is_displayed():
+                                continue
+                            text = elem.text.strip().lower()
+                            if any(w in text for w in ['play', 'start game', 'find game',
+                                                        '10 min', '5 min', '3 min', '1 min',
+                                                        'new game']):
+                                if any(bad in text for bad in ['review', 'analysis']):
+                                    continue
+                                elem.click()
+                                time.sleep(3)
+                                self.dismiss_popups()
+                                return True
+                        except Exception:
+                            pass
+                time.sleep(2)
+                self.dismiss_popups()
+
+            logging.info("No play button found, assuming auto-queued")
+            return True
+        except Exception as e:
+            logging.error(f"start_new_game failed: {e}")
+            return True  # Return True anyway so marathon continues
+
+    def is_alive(self):
+        """Check if the browser is still open. Fast-fail by checking process first."""
+        if self.driver is None:
+            return False
+        try:
+            # Fast check: is the geckodriver process still running?
+            if hasattr(self.driver, 'service') and self.driver.service.process:
+                poll = self.driver.service.process.poll()
+                if poll is not None:
+                    return False  # Process exited
+            # Slower check: can we talk to the browser?
+            _ = self.driver.title
+            return True
+        except Exception:
+            return False
+
+    def close(self):
+        """Close the browser and clean up geckodriver."""
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+        # Kill any orphaned geckodriver processes
+        try:
+            for proc in psutil.process_iter(['name']):
+                if proc.info['name'] and 'geckodriver' in proc.info['name'].lower():
+                    proc.kill()
+        except Exception:
+            pass
+        self.driver = None
+
+
+def detect_playing_color(image, board_bounds):
+    """Auto-detect which color we're playing by checking bottom two rows.
+    Chess.com always shows your pieces at the bottom.
+    Checks both row 7 (rank 1/8) and row 6 (rank 2/7) for robustness."""
+    bx, by, bw, bh = board_bounds
+    cell_w = bw / 8
+    cell_h = bh / 8
+
+    white_bottom = 0
+    black_bottom = 0
+    # Check bottom two rows (more robust than just one)
+    for row in [7, 6]:
+        for col in range(8):
+            x1 = int(bx + col * cell_w)
+            y1 = int(by + row * cell_h)
+            cell = image[y1:y1+int(cell_h), x1:x1+int(cell_w)]
+            color, ratio = classify_cell_color(cell)
+            if color == "w":
+                white_bottom += 1
+            elif color == "b":
+                black_bottom += 1
+
+    # Also check top two rows to cross-validate
+    white_top = 0
+    black_top = 0
+    for row in [0, 1]:
+        for col in range(8):
+            x1 = int(bx + col * cell_w)
+            y1 = int(by + row * cell_h)
+            cell = image[y1:y1+int(cell_h), x1:x1+int(cell_w)]
+            color, ratio = classify_cell_color(cell)
+            if color == "w":
+                white_top += 1
+            elif color == "b":
+                black_top += 1
+
+    # Bottom should have our pieces, top should have opponent's
+    # If bottom=white and top=black → playing white
+    # If bottom=black and top=white → playing black
+    if white_bottom > black_bottom and black_top > white_top:
+        return "w"
+    elif black_bottom > white_bottom and white_top > black_top:
+        return "b"
+    # Single-side fallback
+    if white_bottom > black_bottom + 2:
+        return "w"
+    elif black_bottom > white_bottom + 2:
+        return "b"
+    return None
+
+
+def _detect_color_from_dom(ctrl):
+    """Detect playing color from chess.com's DOM. Returns 'w', 'b', or None."""
+    from selenium.webdriver.common.by import By
+    try:
+        # Method 1: chess.com's board element has a 'flipped' class when playing black
+        for sel in ['wc-chess-board', '.board', 'chess-board']:
+            elems = ctrl.driver.find_elements(By.CSS_SELECTOR, sel)
+            for elem in elems:
+                classes = elem.get_attribute('class') or ''
+                if 'flipped' in classes.lower():
+                    return 'b'
+                # Also check the 'orientation' attribute
+                orientation = elem.get_attribute('orientation')
+                if orientation == 'black':
+                    return 'b'
+                elif orientation == 'white':
+                    return 'w'
+
+        # Method 2: Check coordinate labels — 'a' file on left = white, on right = black
+        # The bottom-left coordinate on chess.com shows '1' for white, '8' for black
+        for sel in ['.coordinates-row .coordinate', '.coordinate-light', '.coordinate-dark']:
+            elems = ctrl.driver.find_elements(By.CSS_SELECTOR, sel)
+            if elems:
+                first_text = elems[0].text.strip()
+                if first_text == '8':
+                    return 'b'
+                elif first_text == '1':
+                    return 'w'
+
+        # Method 3: Check the board element's inline style or data attributes
+        board = ctrl.driver.execute_script("""
+            let b = document.querySelector('wc-chess-board');
+            if (b) return b.getAttribute('flipped') || b.className;
+            return '';
+        """)
+        if board and 'flipped' in str(board).lower():
+            return 'b'
+
+        # Method 4: Check which player name is at the bottom
+        bottom_player = ctrl.driver.execute_script("""
+            let els = document.querySelectorAll('.player-component, .board-player-default');
+            if (els.length >= 2) {
+                let last = els[els.length - 1];
+                let rect = last.getBoundingClientRect();
+                let board = document.querySelector('wc-chess-board, .board');
+                if (board) {
+                    let bRect = board.getBoundingClientRect();
+                    return rect.top > bRect.top + bRect.height / 2 ? 'bottom' : 'top';
+                }
+            }
+            return '';
+        """)
+        # The bottom player is us — check their color from the page
+        # If we can't determine, return None
+    except Exception as e:
+        logging.error(f"DOM color detection failed: {e}")
+    return None
+
+
+# Global Selenium controller (initialized in main loop if auto-move is enabled)
+selenium_controller = None
+
+
+def execute_move_on_screen(move, board_bounds, playing_color):
+    """
+    Execute a chess move. Uses Selenium if available (works on Wayland),
+    falls back to pyautogui (X11 only).
+    """
+    global selenium_controller
+    try:
+        # Use Selenium if available
+        if selenium_controller and selenium_controller.is_alive():
+            return selenium_controller.execute_move(move, playing_color)
+
+        # Fallback to pyautogui (X11 only)
+        src_x, src_y = get_square_screen_coords(move.from_square, board_bounds, playing_color)
+        dst_x, dst_y = get_square_screen_coords(move.to_square, board_bounds, playing_color)
+        src_x += random.randint(-3, 3)
+        src_y += random.randint(-3, 3)
+        dst_x += random.randint(-3, 3)
+        dst_y += random.randint(-3, 3)
+
+        import pyautogui
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.05
+        pyautogui.click(src_x, src_y)
+        time.sleep(random.uniform(0.05, 0.15))
+        pyautogui.click(dst_x, dst_y)
+        if move.promotion:
+            time.sleep(0.3)
+            if move.promotion == chess.QUEEN:
+                pyautogui.click(dst_x, dst_y)
+            elif move.promotion == chess.KNIGHT:
+                pyautogui.click(dst_x, dst_y + int(board_bounds[3] / 8))
+
+        logging.info(f"Auto-moved: {move.uci()} ({src_x},{src_y}) → ({dst_x},{dst_y})")
+        return True
+
+    except Exception as e:
+        logging.error(f"Auto-move failed: {e}")
+        return False
+
+
+# ─── FEN Persistence ──────────────────────────────────────────────────────────
 
 def save_fen(fen, filepath="current_fen.txt"):
     with open(filepath, "w") as f:
@@ -812,277 +2399,898 @@ def load_fen(filepath="current_fen.txt"):
     return None
 
 
-def adjust_skill_level(engine, current_skill, piece_count, move_score_difference):
-    """
-    Adjust the skill level dynamically based on the game state and move quality.
-    Includes mechanisms to prevent downward spirals and allow recovery.
-    """
-    new_skill = current_skill
+# ─── User Input ───────────────────────────────────────────────────────────────
 
-    # Minimum skill level threshold
-    min_skill_level = 5
+def get_user_input():
+    while True:
+        try:
+            skill_level = int(input("Skill level (0-20): ").strip())
+            if 0 <= skill_level <= 20:
+                break
+        except ValueError:
+            pass
+        print("Enter 0-20.")
 
-    # Adjust based on game phase and move quality
-    if piece_count > 25:  # Opening phase
-        new_skill = min(current_skill + 1, 20)  # Increase skill slightly in opening
-    elif piece_count <= 14:  # Endgame
-        new_skill = max(
-            current_skill - 1, min_skill_level
-        )  # Decrease skill in endgame, but not below threshold
-    elif move_score_difference > 200:  # Significant mistake
-        new_skill = max(
-            current_skill - 1, min_skill_level
-        )  # Penalize significant mistakes, limit decrease
-    else:
-        new_skill = min(current_skill + 1, 20)  # Reward good moves
+    while True:
+        randomizer = input("Use anti-detection randomizer? (y/n): ").strip().lower()
+        if randomizer in ("y", "n"):
+            use_randomizer = randomizer == "y"
+            break
+        print("Enter 'y' or 'n'.")
 
-    # Introduce some randomness in skill level adjustments to simulate human variability
-    if random.random() < 0.2:  # 20% chance to adjust skill level randomly
-        adjustment = random.choice([-1, 0, 1])
-        new_skill = max(min(new_skill + adjustment, 20), min_skill_level)
+    while True:
+        auto = input("Auto-move pieces? (y/n): ").strip().lower()
+        if auto in ("y", "n"):
+            auto_move = auto == "y"
+            break
+        print("Enter 'y' or 'n'.")
 
-    if new_skill != current_skill:
-        engine.configure({"Skill Level": new_skill})
-        logging.info(f"Skill level adjusted: {new_skill}")
+    game_mode = None
+    marathon = False
+    if auto_move:
+        while True:
+            mode = input("Mode — bots/players/watch? (b/p/w): ").strip().lower()
+            if mode in ("b", "p", "w"):
+                if mode == "b":
+                    game_mode = "bot"
+                elif mode == "p":
+                    game_mode = "player"
+                else:
+                    game_mode = "watch"
+                break
+            print("Enter 'b', 'p', or 'w'.")
 
-    return new_skill
+        if game_mode != "watch":
+            while True:
+                m = input("Marathon mode — auto-start new games? (y/n): ").strip().lower()
+                if m in ("y", "n"):
+                    marathon = m == "y"
+                    break
+                print("Enter 'y' or 'n'.")
+
+    return skill_level, use_randomizer, auto_move, game_mode, marathon
 
 
-def monitor_chessboard():
+# ─── Main Loop ────────────────────────────────────────────────────────────────
+
+stop_flag = threading.Event()
+action_queue = queue.Queue()
+paused = threading.Event()       # Set = paused
+last_game = threading.Event()    # Set = finish current game then stop marathon
+
+
+_terminal_settings = None
+
+def keyboard_listener():
+    """Listen for hotkeys in a background thread."""
+    global _terminal_settings
+    import sys, select
+    try:
+        import tty, termios
+        _terminal_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+    except Exception:
+        return
+
+    try:
+        while not stop_flag.is_set():
+            if select.select([sys.stdin], [], [], 0.5)[0]:
+                ch = sys.stdin.read(1).lower()
+                if ch == 'p':
+                    if paused.is_set():
+                        paused.clear()
+                        print("\n\033[92m▶ Resumed\033[0m")
+                    else:
+                        paused.set()
+                        print("\n\033[93m⏸ Paused (press P to resume)\033[0m")
+                elif ch == 'l':
+                    if last_game.is_set():
+                        last_game.clear()
+                        print("\n\033[92m↻ Marathon continues\033[0m")
+                    else:
+                        last_game.set()
+                        print("\n\033[93m⏹ Last game — will stop after this game\033[0m")
+    except Exception:
+        pass
+    finally:
+        restore_terminal()
+
+
+def restore_terminal():
+    """Restore terminal to normal mode."""
+    global _terminal_settings
+    if _terminal_settings is not None:
+        try:
+            import sys, termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _terminal_settings)
+            _terminal_settings = None
+        except Exception:
+            pass
+
+
+def signal_handler(sig, frame):
+    stop_flag.set()
+    restore_terminal()
+    print("\nStopping...")
+    global selenium_controller
+    if selenium_controller:
+        try:
+            selenium_controller.close()
+        except Exception:
+            pass
+    os._exit(0)
+
+
+def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
+                       game_mode=None, marathon=False):
+    """Main monitoring loop."""
     engine = initialize_stockfish()
-    current_skill = skill_level  # Initialize the skill level
+    current_skill = skill_level
 
-    # Get script directory for template images
-    script_dir = os.path.dirname(os.path.realpath(__file__))
-    
-    piece_templates = {
-        "br": cv2.imread(os.path.join(script_dir, "black_rook.png")),
-        "bn": cv2.imread(os.path.join(script_dir, "black_knight.png")),
-        "bb": cv2.imread(os.path.join(script_dir, "black_bishop.png")),
-        "bq": cv2.imread(os.path.join(script_dir, "black_queen.png")),
-        "bk": cv2.imread(os.path.join(script_dir, "black_king.png")),
-        "bp": cv2.imread(os.path.join(script_dir, "black_pawn.png")),
-        "wr1": cv2.imread(os.path.join(script_dir, "white_rook.png")),
-        "wr2": cv2.imread(os.path.join(script_dir, "white_rook_withwhitebackground.png")),
-        "wn1": cv2.imread(os.path.join(script_dir, "white_knight.png")),
-        "wn2": cv2.imread(os.path.join(script_dir, "white_knight_withgreenbackground.png")),
-        "wb1": cv2.imread(os.path.join(script_dir, "white_bishop.png")),
-        "wb2": cv2.imread(os.path.join(script_dir, "white_bishop_withgreenbackground.png")),
-        "wq1": cv2.imread(os.path.join(script_dir, "white_queen.png")),
-        "wq2": cv2.imread(os.path.join(script_dir, "white_queen_withgreenbackground.png")),
-        "wk1": cv2.imread(os.path.join(script_dir, "white_king.png")),
-        "wk2": cv2.imread(os.path.join(script_dir, "white_king_withwhitebackground.png")),
-        "wp1": cv2.imread(os.path.join(script_dir, "white_pawn.png")),
-        "wp2": cv2.imread(os.path.join(script_dir, "white_pawn_withgreenbackground.png")),
-    }
+    piece_templates = load_piece_templates()
+    print(f"Loaded {len(piece_templates)} piece templates")
 
-    board = chess.Board()  # Initialize the chess board
-    player_turn = playing_color == "w"  # True if it's the player's turn
-    previous_fen = load_fen()
+    board_bounds = None
+    board_bounds_screen = None
     previous_screenshot_path = None
-    previous_board = None
-    consecutive_invalid_moves = 0
-    max_invalid_moves = 3
-    last_valid_board = None
+    cycle_count = 0
+    uncertain_count = 0
+    max_uncertain = 5
+    detection_failures = 0
+    stats = {'games': 0, 'wins': 0, 'losses': 0, 'draws': 0, 'streak': 0, 'best_streak': 0}
+
+    # Check if auto-move is available
+    global selenium_controller
+    if auto_move:
+        try:
+            selenium_controller = SeleniumController()
+            # Pass playing_color=None for bot mode — it'll use default (white)
+            selenium_controller.launch(game_mode=game_mode, playing_color=playing_color or "w")
+            print("Auto-move: \033[92menabled (Selenium)\033[0m")
+        except Exception as e:
+            logging.error(f"Selenium launch failed: {e}")
+            selenium_controller = None
+            try:
+                import pyautogui
+                pyautogui.FAILSAFE = True
+                print("Auto-move: \033[92menabled (pyautogui)\033[0m")
+            except Exception as e2:
+                print(f"Auto-move: \033[91mdisabled, suggesting moves only\033[0m")
+                auto_move = False
+
+    # GameState created after color detection (placeholder for now)
+    game = None
+
+    # Wait for Selenium to be ready (login, game setup, etc.)
+    if selenium_controller and not selenium_controller.ready:
+        while not stop_flag.is_set() and not selenium_controller.ready:
+            time.sleep(1)
+
+    print("\nWaiting for chessboard...")
 
     while not stop_flag.is_set():
         try:
-            screenshot_path = capture_screenshot(bbox)
+            cycle_count += 1
+
+            # Check if browser is still alive — restart if crashed
+            if selenium_controller and not selenium_controller.is_alive():
+                print("\033[91mBrowser crashed. Restarting...\033[0m")
+                try:
+                    selenium_controller.close()
+                except Exception:
+                    pass
+                try:
+                    selenium_controller = SeleniumController()
+                    selenium_controller.launch(game_mode=game_mode, playing_color=playing_color or "w")
+                    selenium_controller.ready = True
+                    board_bounds = None
+                    board_bounds_screen = None
+                    playing_color = None
+                    game = None
+                    detection_failures = 0
+                    print("\033[92mBrowser restarted.\033[0m")
+                    print("\nWaiting for chessboard...")
+                    time.sleep(3)
+                    continue
+                except Exception as e:
+                    print(f"\033[91mBrowser restart failed: {e}\033[0m")
+                    action_queue.put("game_over")
+                    break
+
+            # Check for game over FIRST every cycle (before board detection)
+            if selenium_controller and selenium_controller.is_alive() and game is not None:
+                _go, _gt = selenium_controller.detect_game_over()
+                if _go:
+                    # Jump directly to game-over handling
+                    result_text = _gt
+                    game_ended = True
+                    # Skip all detection/analysis — go straight to game-over section below
+                    # (the game_ended check is at the end of the loop body)
+
+                    # --- Inline game-over handling ---
+                    rt = result_text.lower()
+                    if 'abort' in rt:
+                        outcome = "abort"
+                    elif 'won' in rt or 'checkmate' in rt or 'victory' in rt:
+                        if playing_color == "w" and 'white' in rt:
+                            outcome = "win"
+                        elif playing_color == "b" and 'black' in rt:
+                            outcome = "win"
+                        elif playing_color == "w" and 'black' in rt:
+                            outcome = "loss"
+                        elif playing_color == "b" and 'white' in rt:
+                            outcome = "loss"
+                        else:
+                            outcome = "win"  # Generic "won" — assume us
+                    elif 'draw' in rt or 'stalemate' in rt:
+                        outcome = "draw"
+                    elif 'lost' in rt or 'timeout' in rt or 'resign' in rt or 'defeat' in rt:
+                        outcome = "loss"
+                    elif 'abandon' in rt:
+                        outcome = "abort"
+                    else:
+                        outcome = "unknown"
+
+                    if outcome == "abort":
+                        print(f"\n\033[93mGame aborted.\033[0m {result_text}")
+                    else:
+                        stats['games'] += 1
+                        if outcome == "win":
+                            stats['wins'] += 1
+                            stats['streak'] += 1
+                            stats['best_streak'] = max(stats['best_streak'], stats['streak'])
+                            print(f"\n\033[1m\033[92mWin!\033[0m {result_text}")
+                        elif outcome == "loss":
+                            stats['losses'] += 1
+                            stats['streak'] = 0
+                            print(f"\n\033[1m\033[91mLoss.\033[0m {result_text}")
+                        elif outcome == "draw":
+                            stats['draws'] += 1
+                            print(f"\n\033[1m\033[93mDraw.\033[0m {result_text}")
+                        else:
+                            print(f"\n\033[1mGame Over:\033[0m {result_text}")
+
+                    # Game summary
+                    move_count = len(game.move_history) if game else 0
+                    print(f"\033[90m  ─── Game Summary ({move_count} moves) ───\033[0m")
+                    if game and hasattr(game, '_opp_cpls') and game._opp_cpls:
+                        cpls = game._opp_cpls
+                        avg = sum(cpls) / len(cpls)
+                        best_pct = sum(1 for c in cpls if c < 10) / len(cpls) * 100
+                        excellent_pct = sum(1 for c in cpls if c < 20) / len(cpls) * 100
+                        inaccuracies = sum(1 for c in cpls if 50 <= c < 100)
+                        mistakes = sum(1 for c in cpls if 100 <= c < 200)
+                        blunders = sum(1 for c in cpls if c >= 200)
+                        worst = max(cpls)
+                        print(f"\033[90m  Opponent: avg CPL={avg:.0f}, best={best_pct:.0f}%, excellent={excellent_pct:.0f}%\033[0m")
+                        print(f"\033[90m  Opponent: {inaccuracies} inaccuracies, {mistakes} mistakes, {blunders} blunders (worst={worst} CPL)\033[0m")
+                        if len(cpls) >= 8:
+                            if avg < 15 and best_pct > 70:
+                                print(f"\033[91m  ⚠ VERDICT: LIKELY ENGINE (avg CPL {avg:.0f}, {best_pct:.0f}% best)\033[0m")
+                            elif avg < 25 and best_pct > 50:
+                                print(f"\033[93m  ⚠ VERDICT: SUSPICIOUS (avg CPL {avg:.0f}, {best_pct:.0f}% best)\033[0m")
+                            elif avg < 40:
+                                print(f"\033[90m  VERDICT: Strong player (avg CPL {avg:.0f})\033[0m")
+                            else:
+                                print(f"\033[92m  VERDICT: Human-level (avg CPL {avg:.0f})\033[0m")
+                    print(f"\033[90m  ──────────────────────────\033[0m")
+                    if stats['games'] > 0:
+                        print(f"\033[90m  Record: {stats['wins']}W-{stats['losses']}L-{stats['draws']}D "
+                              f"({stats['games']} games, streak: {stats['streak']}, best: {stats['best_streak']})\033[0m")
+
+                    if marathon and not last_game.is_set() and selenium_controller.is_alive():
+                        print("\033[90m  Marathon: queuing new game...\033[0m")
+                        if selenium_controller.start_new_game():
+                            board_bounds = None
+                            board_bounds_screen = None
+                            detection_failures = 0
+                            uncertain_count = 0
+                            playing_color = None
+                            game = None
+                            print("\nWaiting for chessboard...")
+                            continue
+                    if last_game.is_set():
+                        print("\033[93mMarathon stopped (last game flag).\033[0m")
+                    action_queue.put("game_over")
+                    break
+
+            # Periodically dismiss chess.com popups (only when ready)
+            if selenium_controller and selenium_controller.ready and cycle_count % 5 == 1:
+                try:
+                    selenium_controller.dismiss_popups()
+                except Exception:
+                    pass
+
+            # Always capture full screen for reliable detection
+            screenshot_path = capture_screenshot(None)
             if not os.path.exists(screenshot_path):
-                logging.error(f"Screenshot file not found: {screenshot_path}")
                 continue
 
-            # Wait for piece movement to complete
+            # Wait for animation to settle
             if previous_screenshot_path:
-                movement_stabilization_attempts = 0
-                while movement_stabilization_attempts < 5:
-                    if not are_images_similar(
-                        previous_screenshot_path, screenshot_path
-                    ):
-                        time.sleep(0.2)  # Wait a short time for movement to complete
-                        screenshot_path = capture_screenshot(bbox)
-                        movement_stabilization_attempts += 1
+                for _ in range(config["move_stabilization_attempts"]):
+                    if not are_images_similar(previous_screenshot_path, screenshot_path):
+                        time.sleep(config["move_stabilization_delay"])
+                        screenshot_path = capture_screenshot(None)
                     else:
                         break
-
             previous_screenshot_path = screenshot_path
 
-            board_image, cell_width, cell_height = detect_chessboard(screenshot_path)
-            if board_image is None:
-                print("Chessboard not detected, retrying in 5 seconds...")
-                logging.error("Chessboard not detected, retrying in 5 seconds...")
-                time.sleep(5)
+            full_image = cv2.imread(screenshot_path)
+            if full_image is None:
                 continue
 
-            (
-                current_board,
-                annotated_board_image,
-                piece_count,
-            ) = extract_board_from_image(
-                board_image, piece_templates, cell_width, cell_height, playing_color
+            # Detect board location every frame (fast enough, handles resizing)
+            detected = find_board_by_colors(full_image)
+            if detected is None:
+                detection_failures += 1
+                if detection_failures <= 3:
+                    time.sleep(1)
+                else:
+                    # Extended failure — slow down to avoid spinning
+                    if detection_failures % 10 == 0:
+                        print("Waiting for chessboard...")
+                    time.sleep(3)
+                continue
+
+            bx, by, bw, bh = detected
+
+            # Board position stability: if we have an established position,
+            # reject detections that jump too far (likely false positives)
+            if board_bounds is not None and detection_failures < 3:
+                old_bx, old_by, old_bw, old_bh = board_bounds
+                dx = abs(bx - old_bx)
+                dy = abs(by - old_by)
+                dw = abs(bw - old_bw)
+                if dx > 150 or dy > 150 or dw > 200:
+                    # Suspiciously large jump — keep old position
+                    logging.info(f"Rejected board jump: ({bx},{by},{bw}) vs ({old_bx},{old_by},{old_bw})")
+                    continue
+
+            # Report board detection (first time, or if size/position changed significantly)
+            if board_bounds is None:
+                print(f"\033[92mBoard found:\033[0m {bw}x{bh} at ({bx},{by}), "
+                      f"cell={bw//8}x{bh//8}px")
+
+                # Auto-detect playing color — poll until DOM and CV agree
+                if playing_color is None:
+                    print("\033[90mDetecting playing color...\033[0m")
+                    for attempt in range(8):
+                        if attempt > 0:
+                            time.sleep(1.5)
+                            fresh_path = capture_screenshot(None)
+                            fresh_img = cv2.imread(fresh_path)
+                            if fresh_img is not None:
+                                full_image = fresh_img
+                                new_det = find_board_by_colors(full_image)
+                                if new_det:
+                                    detected = new_det
+
+                        dom_color = None
+                        cv_color = None
+
+                        if selenium_controller and selenium_controller.is_alive():
+                            dom_color = _detect_color_from_dom(selenium_controller)
+                        cv_color = detect_playing_color(full_image, detected)
+
+                        # If both agree, use that
+                        if dom_color and cv_color and dom_color == cv_color:
+                            playing_color = dom_color
+                            break
+                        # If only CV detected (DOM might not have game yet)
+                        if cv_color and attempt >= 3:
+                            playing_color = cv_color
+                            break
+                        # If only DOM detected and we've waited enough
+                        if dom_color and attempt >= 4:
+                            playing_color = dom_color
+                            break
+
+                    if playing_color is None:
+                        playing_color = "w"
+                        print(f"\033[93mCould not detect color, assuming White\033[0m")
+                    else:
+                        color_name = "White" if playing_color == "w" else "Black"
+                        print(f"\033[92mPlaying as:\033[0m {color_name} (auto-detected)")
+
+                # Initialize game state now that we know the color
+                if game is None:
+                    game = GameState(playing_color)
+                    game_num = stats['games'] + 1
+                    logging.info(f"=== NEW GAME #{game_num} as {playing_color} ===")
+                    print(f"\033[90m  Game #{game_num} started\033[0m")
+            elif detection_failures > 3:
+                print(f"\033[92mBoard re-found:\033[0m {bw}x{bh} at ({bx},{by})")
+            elif abs(bw - board_bounds[2]) > 20 or abs(bx - board_bounds[0]) > 30:
+                print(f"\033[93mBoard moved/resized:\033[0m {bw}x{bh} at ({bx},{by}), "
+                      f"cell={bw//8}x{bh//8}px")
+
+            detection_failures = 0
+            board_bounds = detected
+            board_bounds_screen = detected
+
+            cell_size = min(bw, bh) // 8
+            use_color_only = cell_size < 45
+            if use_color_only and cycle_count <= 2:
+                print(f"\033[93mSmall cells ({cell_size}px):\033[0m using color-only detection + move matching")
+
+            # Skip if game state not initialized yet (waiting for color detection)
+            if game is None:
+                continue
+
+            # Extract board state
+            current_board, annotated, piece_count = extract_board_from_image(
+                full_image, piece_templates, board_bounds, playing_color,
+                color_only=use_color_only
             )
-            cv2.imwrite(os.path.join(script_dir, "annotated_chessboard.png"), annotated_board_image)
+            cv2.imwrite(os.path.join(SCRIPT_DIR, "annotated_chessboard.png"), annotated)
 
-            # Validate the move
-            if not validate_move(previous_board, current_board):
-                consecutive_invalid_moves += 1
-                if consecutive_invalid_moves >= max_invalid_moves:
-                    logging.warning(
-                        "Multiple invalid moves detected, resetting to last valid board state"
-                    )
-                    consecutive_invalid_moves = 0
-                    current_board = (
-                        last_valid_board.copy()
-                        if last_valid_board is not None
-                        else current_board
-                    )
-                    previous_board = None
-                time.sleep(0.5)  # Wait for movement to complete
-                continue
-
-            consecutive_invalid_moves = 0  # Reset counter on valid move
-            previous_board = current_board.copy()
-            last_valid_board = current_board.copy()
-
-            fen = board_to_fen(current_board)
-
-            try:
-                chess.Board(fen)
-                logging.info("FEN is valid")
-            except ValueError:
-                logging.error("Invalid FEN generated")
-                continue
-
-            if fen == previous_fen:
-                # The board has not changed, so skip to the next iteration
+            # Sanity: skip if piece count is clearly wrong (not a real game)
+            if piece_count > 34 or piece_count < 2:
+                logging.info(f"Skipping frame: invalid piece count {piece_count}")
                 time.sleep(1)
                 continue
+
+            # Update game state — use color-only matching if in that mode
+            if use_color_only:
+                result = game.update_from_detection_color_only(current_board)
             else:
-                save_fen(fen)  # Save the new FEN to the file
-                previous_fen = fen
+                result = game.update_from_detection(current_board)
 
-            if playing_color == "w":
-                if player_turn:
-                    (
-                        best_move,
-                        best_move_score,
-                        random_move_score,
-                    ) = get_best_move_with_dynamic_time(
-                        engine, fen, piece_count, use_randomizer, current_skill
+                # If template matching gave uncertain result, retry with color-only
+                if result == "uncertain":
+                    color_board, _, _ = extract_board_from_image(
+                        full_image, piece_templates, board_bounds, playing_color,
+                        color_only=True
                     )
-                    if best_move is not None:
-                        human_readable_move = move_to_readable(
-                            best_move, chess.Board(fen)
-                        )
-                        print(human_readable_move)
-                        logging.info(f"Best move: {best_move}")
-                        logging.info(human_readable_move)
-                        process = psutil.Process(os.getpid())
-                        logging.info(f"CPU usage: {psutil.cpu_percent()}%")
-                        logging.info(
-                            f"Memory usage: {process.memory_info().rss / (1024 * 1024)} MB"
-                        )
+                    color_result = game.update_from_detection_color_only(color_board)
+                    if color_result != "uncertain":
+                        result = color_result
+                        logging.info(f"Color-only fallback succeeded: {result}")
 
-                        # Adjust skill level based on the move quality
-                        move_score_difference = abs(best_move_score - random_move_score)
-                        current_skill = adjust_skill_level(
-                            engine, current_skill, piece_count, move_score_difference
-                        )
+            if result == "no_change":
+                no_change_count = getattr(game, '_no_change_count', 0) + 1 if game else 0
+                if game:
+                    game._no_change_count = no_change_count
+
+                # Show alive indicator every 10 cycles (~5s)
+                if no_change_count % 10 == 0 and game and not game.is_our_turn:
+                    clock = get_clock_remaining(selenium_controller)
+                    clock_str = f" (clock: {clock}s)" if clock else ""
+                    print(f"\033[90m  ...waiting for opponent{clock_str}\033[0m")
+
+                # Watchdog: if stuck 8+ cycles (~4s), force comparison
+                # DON'T clear last_raw_board — that allows phantom pieces to sync
+                # Instead, just reset the counter so we keep trying
+                if game and no_change_count >= 8:
+                    game._no_change_count = 0
+                    # Force a fresh board comparison by marking board as changed
+                    game.consecutive_same = 0
+                    logging.info("Watchdog: resetting detection counters")
+
+                # Check for game over every 3 cycles (~2.5s)
+                if selenium_controller and no_change_count % 3 == 0:
+                    game_ended, result_text = selenium_controller.detect_game_over()
+                    if game_ended:
+                        if game:
+                            game._no_change_count = 0
+                        # Reuse the game-over handling by not continuing
                     else:
-                        logging.error(
-                            "Failed to get best move after multiple attempts."
-                        )
-                    player_turn = False  # It's now the opponent's turn
+                        time.sleep(config["loop_delay"])
+                        continue
                 else:
-                    if board.fen() != fen:
-                        board = chess.Board(fen)  # Update the board state
-                        player_turn = True  # It's now the player's turn
-            else:  # Black player logic
-                if player_turn:  # If it's the player's turn, make a move
-                    (
-                        best_move,
-                        best_move_score,
-                        random_move_score,
-                    ) = get_best_move_with_dynamic_time(
-                        engine, fen, piece_count, use_randomizer, current_skill
+                    time.sleep(config["loop_delay"])
+                    continue
+
+            if result == "uncertain":
+                uncertain_count += 1
+                # Force sync faster when auto-moving (board changes rapidly)
+                sync_threshold = 2 if (auto_move and selenium_controller) else max_uncertain
+                if uncertain_count >= sync_threshold:
+                    game.force_sync(current_board)
+                    uncertain_count = 0
+                    logging.info("Force-synced board state")
+                time.sleep(0.5)
+                continue
+
+            if game:
+                game._no_change_count = 0
+
+            uncertain_count = 0
+            save_fen(game.fen)
+
+            # Pause check
+            while paused.is_set() and not stop_flag.is_set():
+                time.sleep(0.5)
+
+            if result == "our_turn" and engine is not None:
+                # Opponent's move was detected — re-enable sync for future use
+                game._skip_sync_cycles = 0
+
+                # Sanity: don't play if piece count is way off (bad detection)
+                if game.piece_count > 32:
+                    logging.warning(f"Skipping move: invalid piece count {game.piece_count}")
+                    game.force_sync([["" for _ in range(8)] for _ in range(8)])
+                    time.sleep(1)
+                    continue
+
+                # It's our turn — opponent just moved (or game just started)
+                if game.move_history:
+                    last = game.move_history[-1]
+
+                    # Analyze opponent's move quality (skip if low on time)
+                    opp_eval = ""
+                    clock = get_clock_remaining(selenium_controller)
+                    try:
+                        if clock is None or clock > 60:
+                            # Quick single analysis of pre-move position
+                            pre_board = game.board.copy()
+                            pre_board.pop()
+                            opp_analysis = engine.analyse(
+                                pre_board, chess.engine.Limit(depth=6), multipv=1)
+                            opp_best = opp_analysis[0]["pv"][0]
+                            opp_best_score = opp_analysis[0]["score"].relative.score() or 0
+                            # Use our already-available current eval instead of separate analysis
+                            post_score = -(opp_best_score)  # Approximate
+                            cpl = 0 if last == opp_best else abs(opp_best_score) // 2
+                            played_best = (last == opp_best)
+                        else:
+                            raise Exception("Low time — skip opp analysis")
+
+                        if played_best:
+                            opp_eval = f" \033[91m[BEST move, CPL=0]\033[0m"
+                        elif cpl < 20:
+                            opp_eval = f" \033[91m[excellent, CPL={cpl}]\033[0m"
+                        elif cpl < 50:
+                            opp_eval = f" \033[93m[good, CPL={cpl}]\033[0m"
+                        elif cpl < 100:
+                            opp_eval = f" \033[92m[inaccuracy, CPL={cpl}]\033[0m"
+                        elif cpl < 200:
+                            opp_eval = f" \033[92m[mistake, CPL={cpl}]\033[0m"
+                        else:
+                            opp_eval = f" \033[92m[blunder! CPL={cpl}]\033[0m"
+
+                        # Track opponent's overall accuracy
+                        if not hasattr(game, '_opp_cpls'):
+                            game._opp_cpls = []
+                        game._opp_cpls.append(cpl)
+                        avg_cpl = sum(game._opp_cpls) / len(game._opp_cpls)
+                        best_count = sum(1 for c in game._opp_cpls if c < 10)
+                        best_pct = best_count / len(game._opp_cpls) * 100
+
+                        # Sus detection
+                        sus = ""
+                        if len(game._opp_cpls) >= 5:
+                            if avg_cpl < 15 and best_pct > 70:
+                                sus = " \033[91m⚠ LIKELY ENGINE\033[0m"
+                            elif avg_cpl < 25 and best_pct > 50:
+                                sus = " \033[93m⚠ suspicious\033[0m"
+
+                        opp_eval += f"\033[90m  avg CPL={avg_cpl:.0f}, best%={best_pct:.0f}%{sus}\033[0m"
+                    except Exception as e:
+                        logging.error(f"Opponent analysis failed: {e}")
+
+                    print(f"\033[90mOpponent played: {last.uci()}{opp_eval}\033[0m")
+
+                # Try opening book first (instant, no engine, undetectable)
+                book_move = get_book_move(game.board)
+                opp_cpl = None
+                if hasattr(game, '_opp_cpls') and game._opp_cpls:
+                    opp_cpl = sum(game._opp_cpls) / len(game._opp_cpls)
+
+                if book_move and use_randomizer:
+                    move = book_move
+                    best_score = 30  # Approximate neutral eval
+                    sel_score = 30
+                    logging.info(f"Book move: {move.uci()}")
+                else:
+                    move, best_score, sel_score = get_best_move(
+                        engine, game.board, game.piece_count,
+                        use_randomizer, current_skill, opp_avg_cpl=opp_cpl,
                     )
-                    if best_move is not None:
-                        human_readable_move = move_to_readable(
-                            best_move, chess.Board(fen)
-                        )
-                        print(human_readable_move)
-                        logging.info(f"Best move: {best_move}")
-                        logging.info(human_readable_move)
-                        process = psutil.Process(os.getpid())
-                        logging.info(f"CPU usage: {psutil.cpu_percent()}%")
-                        logging.info(
-                            f"Memory usage: {process.memory_info().rss / (1024 * 1024)} MB"
-                        )
 
-                        # Adjust skill level based on the move quality
-                        move_score_difference = abs(best_move_score - random_move_score)
-                        current_skill = adjust_skill_level(
-                            engine, current_skill, piece_count, move_score_difference
-                        )
-                    else:
-                        logging.error(
-                            "Failed to get best move after multiple attempts."
-                        )
-                    player_turn = False  # It's now the opponent's turn
+                if move is not None:
+                    game._last_suggested = move
+
+                    # Human-like think time based on position complexity + clock
+                    if use_randomizer:
+                        clock = get_clock_remaining(selenium_controller)
+                        move_num = len(game.move_history) // 2 + 1
+                        delay = calculate_human_think_time(
+                            game.board, move, best_score, sel_score,
+                            move_num, game.piece_count, clock)
+                        clock_str = f", clock={clock}s" if clock else ""
+                        print(f"\033[90mThinking {delay:.1f}s (move {move_num}{clock_str})...\033[0m")
+                        time.sleep(delay)
+
+                    print_status(game, move, best_score)
+
+                    # AC intel
+                    diff = abs(best_score - sel_score)
+                    move_num = len(game.move_history) // 2 + 1
+                    blunder_zone = 0.03 + max(0, (move_num - 25) * 0.005)
+                    if use_randomizer:
+                        parts = []
+                        if diff > 0:
+                            parts.append(f"sub-optimal (gap={diff/100:.1f})")
+                        else:
+                            parts.append("best move")
+                        parts.append(f"eval: {format_eval(best_score)}\033[90m→{format_eval(sel_score)}")
+                        parts.append(f"\033[90mskill={current_skill}")
+                        if opp_cpl:
+                            parts.append(f"opp CPL={opp_cpl:.0f}")
+                        parts.append(f"blunder%={blunder_zone:.0%}")
+                        print(f"\033[90m  AC: {', '.join(parts)}\033[0m")
+
+                    if auto_move and board_bounds_screen:
+                        if execute_move_on_screen(move, board_bounds_screen, playing_color):
+                            game.board.push(move)
+                            game.move_history.append(move)
+                            game.is_our_turn = False
+                            # DON'T clear last_raw_board — this prevents phantom piece sync.
+                            # Instead, set a flag to skip FEN sync for the next few cycles
+                            # (only use _boards_match and find_matching_move, not the fallback sync)
+                            game._skip_sync_cycles = 9999  # Never use FEN sync after auto-move
+                            logging.info(f"Auto-played: {move.uci()}")
+                            # Wait for animation to settle
+                            time.sleep(1.0)
+                        else:
+                            logging.error("Auto-move failed, showing move instead")
+
+                    current_skill = adjust_skill_level(
+                        engine, current_skill, game.piece_count, diff, game
+                    )
                 else:
-                    if board.fen() != fen:
-                        board = chess.Board(fen)  # Update the board state
-                        player_turn = True  # It's now the player's turn
+                    logging.error("Failed to get best move")
 
-            if check_win(board_image):
-                print("Congratulations! You've won the game!")
-                logging.info("Congratulations! You've won the game!")
-                action_queue.put("won")
-                stop_flag.set()
+            elif result == "their_turn":
+                # We just moved — only notify if it differs from suggestion
+                if game.move_history and hasattr(game, '_last_suggested'):
+                    last = game.move_history[-1]
+                    if last != game._last_suggested:
+                        print(f"\033[93mYou played: {last.uci()} (suggested: {game._last_suggested.uci()})\033[0m")
+
+            # Check for game end — Selenium modal detection (most reliable)
+            game_ended = False
+            result_text = ""
+            if selenium_controller and selenium_controller.is_alive():
+                game_ended, result_text = selenium_controller.detect_game_over()
+
+            # Also check python-chess board state
+            if not game_ended and game.board.is_game_over():
+                game_ended = True
+                result_text = game.board.result()
+
+            # Also check for win visually (only after enough moves)
+            if not game_ended and game and len(game.move_history) >= 4:
+                if check_win(full_image):
+                    game_ended = True
+                    result_text = "You won!"
+
+            if game_ended:
+                # Parse result
+                rt = result_text.lower()
+                if 'abort' in rt:
+                    outcome = "abort"
+                elif 'won' in rt or 'checkmate' in rt or 'you won' in rt or 'victory' in rt:
+                    if playing_color == "w" and 'white' in rt:
+                        outcome = "win"
+                    elif playing_color == "b" and 'black' in rt:
+                        outcome = "win"
+                    elif 'you won' in rt or 'victory' in rt:
+                        outcome = "win"
+                    else:
+                        outcome = "loss"
+                elif 'draw' in rt or 'stalemate' in rt:
+                    outcome = "draw"
+                elif 'lost' in rt or 'timeout' in rt or 'time' in rt or 'resign' in rt or 'defeat' in rt:
+                    outcome = "loss"
+                elif 'abandon' in rt:
+                    outcome = "abort"
+                else:
+                    outcome = "unknown"
+
+                # Update streak
+                if outcome == "abort":
+                    print(f"\n\033[93mGame aborted.\033[0m {result_text}")
+                    # Don't count aborts in stats
+                else:
+                    stats['games'] += 1
+                    if outcome == "win":
+                        stats['wins'] += 1
+                        stats['streak'] += 1
+                        stats['best_streak'] = max(stats['best_streak'], stats['streak'])
+                        print(f"\n\033[1m\033[92mWin!\033[0m {result_text}")
+                    elif outcome == "loss":
+                        stats['losses'] += 1
+                        stats['streak'] = 0
+                        print(f"\n\033[1m\033[91mLoss.\033[0m {result_text}")
+                    elif outcome == "draw":
+                        stats['draws'] += 1
+                        print(f"\n\033[1m\033[93mDraw.\033[0m {result_text}")
+                    else:
+                        print(f"\n\033[1mGame Over:\033[0m {result_text}")
+
+                # Game summary
+                move_count = len(game.move_history) if game else 0
+                print(f"\033[90m  ─── Game Summary ({move_count} moves) ───\033[0m")
+
+                # Our performance
+                if game and hasattr(game, '_last_suggested'):
+                    our_moves = move_count // 2
+                    print(f"\033[90m  Our play: {our_moves} moves, skill={current_skill}\033[0m")
+
+                # Opponent analysis
+                if game and hasattr(game, '_opp_cpls') and game._opp_cpls:
+                    cpls = game._opp_cpls
+                    avg = sum(cpls) / len(cpls)
+                    best_pct = sum(1 for c in cpls if c < 10) / len(cpls) * 100
+                    excellent_pct = sum(1 for c in cpls if c < 20) / len(cpls) * 100
+                    inaccuracies = sum(1 for c in cpls if 50 <= c < 100)
+                    mistakes = sum(1 for c in cpls if 100 <= c < 200)
+                    blunders = sum(1 for c in cpls if c >= 200)
+                    worst = max(cpls)
+
+                    print(f"\033[90m  Opponent: avg CPL={avg:.0f}, "
+                          f"best={best_pct:.0f}%, excellent={excellent_pct:.0f}%\033[0m")
+                    print(f"\033[90m  Opponent: {inaccuracies} inaccuracies, "
+                          f"{mistakes} mistakes, {blunders} blunders (worst={worst} CPL)\033[0m")
+
+                    # Verdict
+                    if len(cpls) >= 8:
+                        if avg < 15 and best_pct > 70:
+                            print(f"\033[91m  ⚠ VERDICT: Opponent is VERY LIKELY using an engine "
+                                  f"(avg CPL {avg:.0f}, {best_pct:.0f}% best moves)\033[0m")
+                        elif avg < 25 and best_pct > 50:
+                            print(f"\033[93m  ⚠ VERDICT: Opponent play is SUSPICIOUS "
+                                  f"(avg CPL {avg:.0f}, {best_pct:.0f}% best moves)\033[0m")
+                        elif avg < 40:
+                            print(f"\033[90m  VERDICT: Strong player, likely clean "
+                                  f"(avg CPL {avg:.0f})\033[0m")
+                        else:
+                            print(f"\033[92m  VERDICT: Human-level play "
+                                  f"(avg CPL {avg:.0f})\033[0m")
+                    else:
+                        print(f"\033[90m  VERDICT: Too few moves to judge ({len(cpls)} analyzed)\033[0m")
+
+                print(f"\033[90m  ──────────────────────────\033[0m")
+
+                if stats['games'] > 0:
+                    print(f"\033[90m  Record: {stats['wins']}W-{stats['losses']}L-{stats['draws']}D "
+                          f"({stats['games']} games, streak: {stats['streak']}, "
+                          f"best: {stats['best_streak']})\033[0m")
+
+                if marathon and not last_game.is_set() and selenium_controller and selenium_controller.is_alive():
+                    print("\033[90m  Marathon: queuing new game...\033[0m")
+                    if selenium_controller.start_new_game():
+                        board_bounds = None
+                        board_bounds_screen = None
+                        detection_failures = 0
+                        uncertain_count = 0
+                        playing_color = None
+                        game = None
+                        print("\nWaiting for chessboard...")
+                        continue
+                    else:
+                        print("Could not start new game automatically.")
+
+                if last_game.is_set():
+                    print("\033[93mMarathon stopped (last game flag).\033[0m")
+                action_queue.put("game_over")
                 break
 
-            time.sleep(1)  # Reduce the sleep time to make it more responsive
+            time.sleep(config["loop_delay"])
 
         except Exception as e:
-            logging.error(f"An unexpected error occurred: {e}")
-            print(f"An unexpected error occurred: {e}")
-            break
+            logging.error(f"Error in main loop: {e}")
+            # Check if this is a browser crash
+            if selenium_controller and not selenium_controller.is_alive():
+                print("\033[91mBrowser crashed. Restarting...\033[0m")
+                try:
+                    selenium_controller.close()
+                except Exception:
+                    pass
+                try:
+                    selenium_controller = SeleniumController()
+                    selenium_controller.launch(game_mode=game_mode, playing_color=playing_color or "w")
+                    selenium_controller.ready = True
+                    board_bounds = None
+                    board_bounds_screen = None
+                    playing_color = None
+                    game = None
+                    detection_failures = 0
+                    print("\033[92mBrowser restarted.\033[0m\nWaiting for chessboard...")
+                    time.sleep(3)
+                except Exception as e2:
+                    print(f"\033[91mRestart failed: {e2}\033[0m")
+                    action_queue.put("game_over")
+                    break
+            else:
+                time.sleep(2)
 
     if not stop_flag.is_set():
         action_queue.put("finished")
 
 
-def handle_user_input():
+def handle_user_input(playing_color, skill_level, use_randomizer, auto_move):
+    """Handle post-game user interaction."""
     while True:
         action = action_queue.get()
-        if action == "won":
+        if action in ("won", "game_over"):
             while True:
-                play_again = (
-                    input("Do you want to play another game? (y/n): ").strip().lower()
-                )
-                if play_again == "y":
+                choice = input("Play again? (y/n): ").strip().lower()
+                if choice == "y":
                     stop_flag.clear()
-                    monitor_thread = threading.Thread(target=monitor_chessboard)
-                    monitor_thread.start()
+                    t = threading.Thread(
+                        target=monitor_chessboard,
+                        args=(playing_color, skill_level, use_randomizer, auto_move),
+                    )
+                    t.start()
                     break
-                elif play_again == "n":
-                    print("Thank you for playing! Exiting...")
+                elif choice == "n":
+                    print("Thanks for playing!")
                     os._exit(0)
                 else:
-                    print("Invalid input. Please enter 'y' for yes or 'n' for no.")
+                    print("Enter 'y' or 'n'.")
         elif action == "finished":
             break
 
 
-monitor_thread = threading.Thread(target=monitor_chessboard)
-monitor_thread.start()
+# ─── Entry Point ──────────────────────────────────────────────────────────────
 
-user_input_thread = threading.Thread(target=handle_user_input)
-user_input_thread.start()
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
 
-monitor_thread.join()
-user_input_thread.join()
+    import sys
+    print("\033[1m═══ Chess.com Assistant ═══\033[0m\n")
 
-# Close the Stockfish engine properly
-if "engine" in locals() and engine is not None:
-    engine.quit()
+    # Check for -r (resume) flag
+    if '-r' in sys.argv or '--resume' in sys.argv:
+        session = load_session()
+        if session:
+            skill_level = session['skill_level']
+            use_randomizer = session['use_randomizer']
+            auto_move = session['auto_move']
+            game_mode = session.get('game_mode')
+            marathon = session.get('marathon', False)
+            print(f"\033[92mResuming:\033[0m skill={skill_level}, AC={'on' if use_randomizer else 'off'}, "
+                  f"auto={'on' if auto_move else 'off'}, mode={game_mode or 'manual'}, "
+                  f"marathon={'on' if marathon else 'off'}")
+        else:
+            print("\033[93mNo previous session found. Starting fresh.\033[0m")
+            skill_level, use_randomizer, auto_move, game_mode, marathon = get_user_input()
+    else:
+        skill_level, use_randomizer, auto_move, game_mode, marathon = get_user_input()
+    print()
+
+    # Save session for future -r
+    save_session(skill_level, use_randomizer, auto_move, game_mode, marathon)
+    save_config(config)
+
+    if auto_move:
+        print("\033[90mHotkeys: P = pause/resume, L = last game (stop marathon after current)\033[0m")
+
+    # Start keyboard listener for hotkeys
+    kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    kb_thread.start()
+
+    # playing_color will be auto-detected from the board
+    monitor_thread = threading.Thread(
+        target=monitor_chessboard,
+        args=(None, skill_level, use_randomizer, auto_move, game_mode, marathon),
+    )
+    monitor_thread.start()
+
+    input_thread = threading.Thread(
+        target=handle_user_input,
+        args=(None, skill_level, use_randomizer, auto_move),
+    )
+    input_thread.start()
+
+    try:
+        monitor_thread.join()
+        input_thread.join()
+    finally:
+        restore_terminal()
+        if selenium_controller:
+            selenium_controller.close()
