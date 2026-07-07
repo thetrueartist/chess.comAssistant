@@ -1,89 +1,76 @@
 # Chess.com Assistant ♟️👁️🤖
 
-**A smart chess bot that combines computer vision and AI to show you the best chess moves in real-time on Chess.com**
+**A computer-vision + Stockfish assistant that reads the board on Chess.com, finds strong moves in real time, and can play them for you through the browser — with human-like timing and anti-detection built in.**
+
+> ⚠️ **Educational / research project.** Using engine assistance in live games violates the Chess.com Fair Play policy and can get your account banned. Use it on your own account, against the bots, at your own risk.
 
 ## Features ✨
-- 🖥️ **Screen Analysis**: Automatically detects chessboard position using OpenCV + PyTorch Vision
-
-- 🤖 **ML Chess Engine Integration With Stockfish**: Powered by Stockfish engine with dynamic difficulty adjustment (0-20 skill levels)
-
-- 🕵️ **Anti-Detection System**: 
-  - Randomized move timing patterns
-  - Human-like move selection variance
-  - Dynamic skill adjustment
-
-- 🧠 **Smart Game Analysis**:
-  - Real-time FEN position recognition
-  - Automatic game phase detection (opening/middlegame/endgame)
-  - Adaptive thinking time based on position complexity
-
-- 📊 **Performance Monitoring**:
-  - CPU/Memory usage tracking
-  - Detailed error logging
-  - Move validation system
-
-- ♟️ **Game Features**:
-  - Supports both white and black pieces
-  - Win condition detection
-  - Multi-game session support
+- 👁️ **Board detection (OpenCV)** — finds the board on screen by its colors and verifies the checkerboard pattern. Auto-locates the board at any resolution and auto-detects which color you're playing (from the board plus Chess.com's DOM). Resolution-independent, no machine-learning model required. *(The old PyTorch/ResNet50 recognizer has been replaced with fast template matching.)*
+- 🤖 **Stockfish engine** — skill levels 0–20, adaptive search depth with automatic deepening on critical positions.
+- ♟️ **Real game-state tracking (python-chess)** — reconstructs the full position (castling, en-passant, move counters) by matching each detected board to a legal move, with a color-only fallback and FEN re-sync when tracking drifts.
+- 🖱️ **Auto-play via Selenium** — clicks moves directly into the Chess.com DOM, so it works on **Wayland** (not just X11). Human-like mouse paths: Bézier curves, ease-in/out, slight overshoot and tremor. Falls back to pyautogui on X11.
+- 🕵️ **Anti-detection**
+  - Bimodal, clock-aware "human think time"
+  - Randomized depth, exponential move-weighting, occasional lazy/blunder moves
+  - Dynamic skill adjustment that estimates the opponent's strength (from their centipawn loss) and plays *slightly* above them
+  - Built-in opening book for the first several moves
+- 🔐 **Auto-login** — imports your Chess.com cookies from your real Firefox profile (falls back to manual login).
+- 📊 **Opponent analysis** — tracks the opponent's average centipawn loss and flags likely engine users.
+- 🎮 **Modes & marathon**
+  - Play vs **bots**, vs **online players**, or **watch** (suggest-only)
+  - **Marathon**: auto-queues new games, with a live W/L/D record and streaks
+  - Hotkeys: **P** pause/resume, **L** finish the current game then stop
+  - `-r` resumes your last session
+- 🛟 Game-over detection (DOM + visual) and automatic restart if the browser crashes.
 
 ## How It Works 🔧
-1. **Computer Vision Pipeline**:
-   - Screenshot capture with `pyscreenshot`
-   - Chessboard detection using OpenCV contour analysis
-   - Piece recognition with ResNet50 deep learning model
-   - Perspective transformation for board alignment
-
-2. **AI Engine**:
-   - Stockfish integration with optimized parameters
-   - Dynamic depth adjustment (15-30 plies)
-   - Position complexity analysis using move entropy
-   - Multi-variant move selection with weighted randomness
-
-3. **Anti-Detection System**:
-   - Randomized delay patterns (0.1-2.5s)
-   - Skill level variability during gameplay
-   - Natural move timing based on position complexity
+1. **Vision** — `pyscreenshot` grabs the screen → OpenCV locates the board by HSV color + checkerboard validation → each cell is classified (empty / white / black) and identified by per-cell template matching.
+2. **State** — detected boards are matched against python-chess legal moves to keep an exact `GameState`; a FEN re-sync recovers if tracking drifts.
+3. **Move choice** — opening book first, otherwise Stockfish `multipv` analysis with weighted, human-like selection and optional blunders.
+4. **Play** — Selenium moves the mouse along a natural curve and clicks the from/to squares after a realistic think-time delay.
 
 ## Requirements 📦
-```bash
-Python 3.8+
-Stockfish 15+ (path configuration required)
-torch
-torchvision
-opencv-python
-pyscreenshot
-python-chess
-psutil
 ```
+Python 3.8+
+Stockfish                 # engine
+Firefox + geckodriver     # for Selenium auto-play
+python-chess
+opencv-python
+numpy
+pyscreenshot
+selenium
+pyautogui                 # X11 fallback
+psutil
+pillow
+```
+> No `torch` / `torchvision` anymore — the vision pipeline is pure OpenCV now.
+
 ## Installation 🛠️
 ```bash
-pip install opencv-python numpy pyscreenshot torch torchvision python-chess psutil pillow
+pip install -r requirements.txt
+# (on newer distros you may need:  pip install --break-system-packages -r requirements.txt )
 
-(you might need to use --break-system-packages on newer versions of linux for that pip command)
-
-sudo apt-get install stockfish  # Debian/Ubuntu
-brew install stockfish          # MacOS
+# Engine + browser
+sudo apt-get install stockfish firefox     # Debian/Ubuntu
+sudo snap install geckodriver              # or grab it from the Mozilla releases page
+# macOS:  brew install stockfish
 ```
+**Windows:** download Stockfish from https://stockfishchess.org/download/ and geckodriver from the Mozilla `geckodriver` releases page.
 
-Or for Windows download the latest version of stockfish here:
-https://stockfishchess.org/download/
+## Usage ▶️
+```bash
+python3 chessAssistant.py        # then answer the prompts
+python3 chessAssistant.py -r     # resume last session
+```
+You'll be asked for the skill level, whether to use the anti-detection randomizer, whether to auto-move, the mode (bots / players / watch), and marathon on/off. Settings are saved to `config.json` and `last_session.json`.
 
-(I may add in auto downloading of stockfish on windows at some point)
+## Notes 🗒️
+- **Ideal layout:** Chess.com on the **left half** of the screen, terminal on the **right**. Works best at **1440p** on the **default Chess.com theme**.
+- Auto-play opens its own Selenium-controlled Firefox window, so it works on Wayland; the pyautogui path needs X11.
+- Windows is supported (screen capture falls back to Pillow's `ImageGrab`).
+- Files it writes next to the script: `current_fen.txt` (the live position), `annotated_chessboard.png` (a debug overlay of what it detected), `chess_engine_error.log`, plus your saved `config.json` / `last_session.json`.
+- *Work in progress — expect rough edges.* :p
 
-## NOTES 🗒️
-
-<h3> NOW WITH WINDOWS SUPPORT! </h3> 
-<h4> :) </h4>
-
-![chessAssistantWindows](https://github.com/thetrueartist/chess.comAssistant/blob/main/chessAssistantWINDOWS.png)
-
-**Chess.com Assistant is ideally used with the terminal on the right half of your screen and the chess.com window on the left half. It additionally only works on the default Chess.com theme.**
-
-**It works best at 1440p resolution.**
-![chessAssistantLinux](https://github.com/thetrueartist/chess.comAssistant/blob/main/chessAssistant.png)
-
-*WORK IN PROGRESS, A LITTLE BUGGY :p*
-
-
-
+## Screenshots 📸
+![chessAssistant on Linux](https://github.com/thetrueartist/chess.comAssistant/blob/main/chessAssistant.png)
+![chessAssistant on Windows](https://github.com/thetrueartist/chess.comAssistant/blob/main/chessAssistantWINDOWS.png)

@@ -1,0 +1,16 @@
+# Chess.com Assistant — Python dependencies
+# Install:  pip install -r requirements.txt
+# (on newer distros you may need:  pip install --break-system-packages -r requirements.txt)
+#
+# Also required, but installed separately (not pip):
+#   - Stockfish            (sudo apt-get install stockfish  /  brew install stockfish)
+#   - Firefox + geckodriver (for Selenium auto-play)
+
+python-chess
+opencv-python
+numpy
+pyscreenshot
+selenium
+pyautogui
+psutil
+pillow
