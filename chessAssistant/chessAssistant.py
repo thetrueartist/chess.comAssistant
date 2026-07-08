@@ -93,7 +93,7 @@ def load_session():
 # NOTE: this NEVER downloads or overwrites any file — it only tells you when a
 # newer, cryptographically-signed release exists on GitHub. Applying it is manual.
 
-__version__ = "6.0.8"  # bump on each release; the updater compares this to GitHub
+__version__ = "6.0.9"  # bump on each release; the updater compares this to GitHub
 RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
 _UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
                     "chess.comAssistant/main/chessAssistant")
@@ -1891,64 +1891,35 @@ class SeleniumController:
                 if not os.path.exists(cookie_db):
                     continue
                 try:
-                    # Copy the DB + its WAL/SHM sidecars so recent cookies (e.g. a
-                    # fresh login still sitting in the write-ahead log) are included.
-                    # Copying only .sqlite reads a stale snapshot that misses them.
+                    # Copy the DB (Firefox locks it while running)
                     import shutil
                     tmp_db = os.path.join(tempfile.gettempdir(), "chess_cookies.sqlite")
-                    for suf in ("", "-wal", "-shm"):
-                        try:
-                            if os.path.exists(cookie_db + suf):
-                                shutil.copy2(cookie_db + suf, tmp_db + suf)
-                        except Exception:
-                            pass
+                    shutil.copy2(cookie_db, tmp_db)
 
                     conn = sqlite3.connect(tmp_db)
                     cursor = conn.cursor()
-                    cursor.execute("SELECT name, value, host, path, expiry, isSecure, "
-                                   "isHttpOnly, sameSite FROM moz_cookies "
-                                   "WHERE host LIKE '%chess.com%'")
+                    cursor.execute("SELECT name, value, host, path, isSecure FROM moz_cookies WHERE host LIKE '%chess.com%'")
                     cookies = cursor.fetchall()
                     conn.close()
-                    for suf in ("", "-wal", "-shm"):
-                        try:
-                            if os.path.exists(tmp_db + suf):
-                                os.remove(tmp_db + suf)
-                        except Exception:
-                            pass
+                    os.remove(tmp_db)
 
                     if cookies:
                         # Navigate to chess.com first (cookies need matching domain)
                         self.driver.get('https://www.chess.com')
                         time.sleep(2)
                         imported = 0
-                        samesite_map = {0: 'None', 1: 'Lax', 2: 'Strict'}
-                        for name, value, host, path, expiry, secure, httponly, samesite in cookies:
-                            # Carry ALL attributes so the (httpOnly, secure) session
-                            # cookie transfers — that's the one that keeps you logged in.
-                            ck = {'name': name, 'value': value, 'domain': host,
-                                  'path': path or '/', 'secure': bool(secure)}
+                        for name, value, host, path, secure in cookies:
                             try:
-                                if expiry and int(expiry) > 0:
-                                    ck['expiry'] = int(expiry)
-                            except Exception:
-                                pass
-                            if httponly:
-                                ck['httpOnly'] = True
-                            ss = samesite_map.get(samesite)
-                            if ss:
-                                ck['sameSite'] = ss
-                            try:
-                                self.driver.add_cookie(ck)
+                                self.driver.add_cookie({
+                                    'name': name,
+                                    'value': value,
+                                    'domain': host,
+                                    'path': path,
+                                    'secure': bool(secure),
+                                })
                                 imported += 1
                             except Exception:
-                                # Strict attribute rejected — retry with just the essentials
-                                try:
-                                    self.driver.add_cookie({'name': name, 'value': value,
-                                                            'domain': host, 'path': path or '/'})
-                                    imported += 1
-                                except Exception:
-                                    pass
+                                pass
                         if imported > 0:
                             logging.info(f"Imported {imported} cookies from Firefox profile")
                             return True
