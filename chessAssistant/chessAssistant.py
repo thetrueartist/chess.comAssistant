@@ -93,7 +93,7 @@ def load_session():
 # NOTE: this NEVER downloads or overwrites any file — it only tells you when a
 # newer, cryptographically-signed release exists on GitHub. Applying it is manual.
 
-__version__ = "6.0.4"  # bump on each release; the updater compares this to GitHub
+__version__ = "6.0.5"  # bump on each release; the updater compares this to GitHub
 RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
 _UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
                     "chess.comAssistant/main/chessAssistant")
@@ -132,6 +132,12 @@ def apply_update(remote_bytes, remote_ver):
         with open(target, "wb") as f:
             f.write(remote_bytes)
         print(f"\033[92m✓ Updated to v{remote_ver}  (backup: {os.path.basename(target)}.bak)\033[0m")
+        if platform.system() == "Windows":
+            # os.execv doesn't cleanly replace the process on Windows — it returns
+            # to the shell and garbles the console — so exit cleanly and let the
+            # user restart instead of auto-relaunching.
+            print("\033[92m  Update installed. Restart to use it:\033[0m python chessAssistant.py")
+            os._exit(0)
         print("\033[90m  Restarting...\033[0m")
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
