@@ -93,7 +93,7 @@ def load_session():
 # NOTE: this NEVER downloads or overwrites any file — it only tells you when a
 # newer, cryptographically-signed release exists on GitHub. Applying it is manual.
 
-__version__ = "6.0.2"  # bump on each release; the updater compares this to GitHub
+__version__ = "6.0.3"  # bump on each release; the updater compares this to GitHub
 RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
 _UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
                     "chess.comAssistant/main/chessAssistant")
@@ -1174,6 +1174,21 @@ def initialize_stockfish():
             found = shutil.which("stockfish")
             if found:
                 return found
+            # Last resort: deep-scan every drive (skip system/huge dirs)
+            print("Searching all drives for Stockfish (this can take a moment)...")
+            skip = {"windows", "$recycle.bin", "system volume information",
+                    "appdata", "node_modules", ".git", "winsxs"}
+            for d in drives:
+                try:
+                    for root, dirs, files in os.walk(d):
+                        dirs[:] = [x for x in dirs if x.lower() not in skip]
+                        for f in files:
+                            if f.lower().startswith("stockfish") and f.lower().endswith(".exe"):
+                                return os.path.join(root, f)
+                        if root.count(os.sep) - d.count(os.sep) > 5:
+                            dirs.clear()
+                except (PermissionError, OSError):
+                    continue
         return None
 
     stockfish_path = find_stockfish_exe()
