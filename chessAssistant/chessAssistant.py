@@ -93,7 +93,7 @@ def load_session():
 # NOTE: this NEVER downloads or overwrites any file — it only tells you when a
 # newer, cryptographically-signed release exists on GitHub. Applying it is manual.
 
-__version__ = "6.0.3"  # bump on each release; the updater compares this to GitHub
+__version__ = "6.0.4"  # bump on each release; the updater compares this to GitHub
 RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
 _UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
                     "chess.comAssistant/main/chessAssistant")
@@ -1916,48 +1916,82 @@ class SeleniumController:
                     logging.error(f"Cookie import failed: {e}")
         return False
 
+    def _is_logged_in(self):
+        """Positively verify authentication. True only when we're NOT on any
+        login/signup/verify page AND no 'Log In'/'Sign Up' control is visible
+        (chess.com replaces those with the user avatar once you're signed in).
+        Deliberately conservative so it never fires mid-login or mid-signup."""
+        from selenium.webdriver.common.by import By
+        try:
+            url = self.driver.current_url.lower()
+        except Exception:
+            return False
+        # Still inside a login / sign-up / verification flow
+        if any(w in url for w in ('login', 'register', 'signup', 'sign-up', 'join',
+                                  'password', 'verify', '/email', '/checkout')):
+            return False
+        # A visible Log In / Sign Up call-to-action means we're not logged in yet
+        try:
+            for e in self.driver.find_elements(By.CSS_SELECTOR, 'a, button, [role="button"]'):
+                try:
+                    if not e.is_displayed():
+                        continue
+                    t = " ".join((e.text or "").split()).lower()
+                    if t in ('log in', 'login', 'sign in', 'sign up', 'signup',
+                             'sign up free', 'join now', 'create account'):
+                        return False
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return True
+
     def _wait_for_login_and_play(self):
-        """Try cookie import first, fall back to manual login."""
-        # Try to import cookies from real Firefox
+        """Cookie import first; otherwise wait until the user is *verifiably* logged
+        in. Supports signing up too — it waits through the whole register/verify
+        flow and only proceeds once you're really signed in."""
+        # Try cookies first
         if self._import_cookies_from_firefox():
             self.driver.get('https://www.chess.com/home')
             time.sleep(3)
-            url = self.driver.current_url
-            if 'login' not in url.lower():
+            if self._is_logged_in():
                 print("\033[92mLogged in via cookies!\033[0m")
                 self.driver.get('https://www.chess.com/play/online')
                 time.sleep(3)
                 self.dismiss_popups()
                 return
-            print("\033[93mCookies expired, need fresh login.\033[0m")
+            print("\033[93mCookies expired — please log in or sign up.\033[0m")
 
-        # Fall back: open login page and wait
+        # Open the login page (there's a 'Sign Up' link there too)
         self.driver.get('https://www.chess.com/login')
         time.sleep(2)
-
-        url = self.driver.current_url
-        if 'login' not in url.split('?')[0]:
+        if self._is_logged_in():
             print("\033[92mAlready logged in!\033[0m")
             self.driver.get('https://www.chess.com/play/online')
             time.sleep(3)
             self.dismiss_popups()
             return
 
-        print("\033[93mPlease log in to chess.com in the browser...\033[0m")
-        print("\033[90m  (If Cloudflare blocks login here, log in on your normal Firefox first,\033[0m")
-        print("\033[90m   then restart the assistant — it will import your cookies.)\033[0m")
+        print("\033[93mPlease log in — or sign up — to chess.com in the browser.\033[0m")
+        print("\033[90m  Take your time; it won't start a game until you're fully signed in.\033[0m")
+        print("\033[90m  (If Cloudflare blocks login, sign in on your normal Firefox first,\033[0m")
+        print("\033[90m   then restart — it will import your cookies.)\033[0m")
+        confirmed = 0
         while True:
             time.sleep(2)
             try:
-                url = self.driver.current_url
-                if 'login' not in url.split('?')[0]:
-                    print("\033[92mLogged in!\033[0m Navigating to play...")
-                    self.driver.get('https://www.chess.com/play/online')
-                    time.sleep(3)
-                    self.dismiss_popups()
-                    return
+                if self._is_logged_in():
+                    confirmed += 1
+                    if confirmed >= 2:      # stable for ~4s to avoid a mid-redirect fluke
+                        print("\033[92mSigned in!\033[0m Navigating to play...")
+                        self.driver.get('https://www.chess.com/play/online')
+                        time.sleep(3)
+                        self.dismiss_popups()
+                        return
+                else:
+                    confirmed = 0
             except Exception:
-                pass
+                confirmed = 0
 
     def dismiss_popups(self):
         """Auto-dismiss chess.com popups, modals, cookie banners, etc.
