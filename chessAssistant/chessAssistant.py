@@ -93,7 +93,7 @@ def load_session():
 # NOTE: this NEVER downloads or overwrites any file — it only tells you when a
 # newer, cryptographically-signed release exists on GitHub. Applying it is manual.
 
-__version__ = "6.0.1"  # bump on each release; the updater compares this to GitHub
+__version__ = "6.0.2"  # bump on each release; the updater compares this to GitHub
 RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
 _UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
                     "chess.comAssistant/main/chessAssistant")
@@ -1137,19 +1137,23 @@ def initialize_stockfish():
             if found:
                 return found
         else:
+            import string
+            drives = [f"{d}:\\" for d in string.ascii_uppercase
+                      if os.path.exists(f"{d}:\\")]
             # Windows: check known paths first
             quick_paths = [
                 os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "Stockfish", "stockfish.exe"),
                 os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"), "Stockfish", "stockfish.exe"),
-                os.path.join(os.path.expanduser("~"), "Downloads", "stockfish.exe"),
                 "stockfish.exe",
             ]
+            quick_paths += [os.path.join(d, "Downloads", "stockfish.exe") for d in drives]
             for path in quick_paths:
                 if os.path.exists(path):
                     return path
-            # Search common directories for any stockfish executable
-            search_dirs = [
-                os.path.expanduser("~") + r"\Downloads",
+            # Search the Downloads folder on EVERY drive (+ Program Files) for any
+            # stockfish*.exe — handles Stockfish extracted to D:\Downloads etc.
+            search_dirs = [os.path.join(d, "Downloads") for d in drives]
+            search_dirs += [
                 os.environ.get("PROGRAMFILES", r"C:\Program Files"),
                 os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
             ]
@@ -1159,10 +1163,10 @@ def initialize_stockfish():
                 try:
                     for root, dirs, files in os.walk(search_dir):
                         for f in files:
-                            if f.lower().startswith("stockfish") and f.endswith(".exe"):
+                            if f.lower().startswith("stockfish") and f.lower().endswith(".exe"):
                                 return os.path.join(root, f)
                         # Don't recurse too deep
-                        if root.count(os.sep) - search_dir.count(os.sep) > 3:
+                        if root.count(os.sep) - search_dir.count(os.sep) > 4:
                             dirs.clear()
                 except (PermissionError, OSError):
                     continue
@@ -1701,15 +1705,15 @@ class SeleniumController:
 
         opts = Options()
         if platform.system() == "Windows":
+            import string
+            _drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
             browser_paths = [
                 os.path.join(os.environ.get("PROGRAMFILES", ""), "Mozilla Firefox", "firefox.exe"),
                 os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Mozilla Firefox", "firefox.exe"),
                 os.path.join(os.path.expanduser("~"), "AppData", "Local", "Mozilla Firefox", "firefox.exe"),
             ]
-            gecko_candidates = [
-                os.path.join(os.path.expanduser("~"), "Downloads", "geckodriver.exe"),
-                "geckodriver.exe",
-            ]
+            gecko_candidates = ["geckodriver.exe"]
+            gecko_candidates += [os.path.join(d, "Downloads", "geckodriver.exe") for d in _drives]
         else:
             browser_paths = [
                 '/snap/firefox/current/usr/lib/firefox/firefox',
@@ -3641,6 +3645,15 @@ def handle_user_input(playing_color, skill_level, use_randomizer, auto_move):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
+
+    # Windows: enable ANSI colour codes in the console (VT processing)
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            _k = ctypes.windll.kernel32
+            _k.SetConsoleMode(_k.GetStdHandle(-11), 7)
+        except Exception:
+            pass
 
     import sys
     print("\033[1m═══ Chess.com Assistant ═══\033[0m\n")
