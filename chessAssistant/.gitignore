@@ -1,0 +1,12 @@
+# Runtime / user-specific files — never commit (may contain personal data)
+__pycache__/
+*.pyc
+*.log
+*.bak
+config.json
+last_session.json
+current_fen.txt
+annotated_chessboard.png
+time_probe_output.txt
+release_signing_key.pem
+*.sqlite

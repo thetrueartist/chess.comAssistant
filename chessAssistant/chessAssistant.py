@@ -63,7 +63,8 @@ def save_config(config):
 
 SESSION_PATH = os.path.join(SCRIPT_DIR, "last_session.json")
 
-def save_session(skill_level, use_randomizer, auto_move, game_mode, marathon):
+def save_session(skill_level, use_randomizer, auto_move, game_mode, marathon,
+                 time_control=None, auto_report=False):
     """Save session settings for -r resume."""
     with open(SESSION_PATH, "w") as f:
         json.dump({
@@ -72,6 +73,8 @@ def save_session(skill_level, use_randomizer, auto_move, game_mode, marathon):
             "auto_move": auto_move,
             "game_mode": game_mode,
             "marathon": marathon,
+            "time_control": time_control,
+            "auto_report": auto_report,
         }, f, indent=2)
 
 
@@ -84,6 +87,107 @@ def load_session():
         except Exception:
             pass
     return None
+
+
+# ─── Auto-Update (check + notify only, Ed25519 signature-verified) ────────────
+# NOTE: this NEVER downloads or overwrites any file — it only tells you when a
+# newer, cryptographically-signed release exists on GitHub. Applying it is manual.
+
+__version__ = "6.0.0"  # bump on each release; the updater compares this to GitHub
+RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
+_UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
+                    "chess.comAssistant/main/chessAssistant")
+
+
+def _parse_version(s):
+    try:
+        return tuple(int(x) for x in str(s).strip().split("."))
+    except Exception:
+        return None
+
+
+def _verify_release_signature(data_bytes, sig_b64):
+    """Verify an Ed25519 signature over data_bytes against the embedded public key.
+    Returns True (valid), False (invalid/mismatch), or None (crypto unavailable)."""
+    try:
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except Exception:
+        return None
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(RELEASE_SIGNING_PUBKEY_B64))
+        pub.verify(base64.b64decode((sig_b64 or "").strip()), data_bytes)
+        return True
+    except Exception:
+        return False
+
+
+def apply_update(remote_bytes, remote_ver):
+    """Overwrite this file with the (already signature-verified) new version,
+    keeping a .bak, then relaunch. Only call AFTER the signature has verified."""
+    import sys, shutil as _sh
+    target = os.path.realpath(__file__)
+    try:
+        _sh.copy2(target, target + ".bak")
+        with open(target, "wb") as f:
+            f.write(remote_bytes)
+        print(f"\033[92m✓ Updated to v{remote_ver}  (backup: {os.path.basename(target)}.bak)\033[0m")
+        print("\033[90m  Restarting...\033[0m")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        logging.error(f"apply_update failed: {e}")
+        print(f"\033[91mUpdate failed ({e}) — current version unchanged. "
+              f"Update manually with: git pull\033[0m")
+
+
+def check_for_update(timeout=4):
+    """Check GitHub for a newer, signature-verified release. If one is found and
+    its signature verifies, offer to install it (backs up + relaunches).
+    Safe to call at startup; never raises."""
+    import urllib.request, re
+
+    def _fetch(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "chessAssistant-updater"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+
+    try:
+        remote_bytes = _fetch(_UPDATE_RAW_BASE + "/chessAssistant.py")
+    except Exception as e:
+        logging.info(f"Update check skipped: {e}")
+        return
+    m = re.search(rb'^__version__\s*=\s*["\']([^"\']+)["\']', remote_bytes, re.M)
+    if not m:
+        return  # remote has no version marker yet — nothing to compare
+    remote_ver = m.group(1).decode()
+    rv, lv = _parse_version(remote_ver), _parse_version(__version__)
+    if not rv or not lv or rv <= lv:
+        logging.info(f"Up to date (local {__version__}, remote {remote_ver})")
+        return
+
+    # Newer version found — verify its signature BEFORE recommending it.
+    try:
+        sig_b64 = _fetch(_UPDATE_RAW_BASE + "/chessAssistant.py.sig").decode()
+    except Exception:
+        sig_b64 = None
+    verdict = _verify_release_signature(remote_bytes, sig_b64) if sig_b64 else False
+
+    print()
+    if verdict is True:
+        print(f"\033[92m🔔 Update available: v{remote_ver} (you have v{__version__}) — signature ✓ verified\033[0m")
+        try:
+            ans = input("   Install it now? (y/n): ").strip().lower()
+        except Exception:
+            ans = "n"
+        if ans == "y":
+            apply_update(remote_bytes, remote_ver)   # backs up, writes, relaunches
+        else:
+            print(f"\033[90m   Skipped. (You can also update later with: cd {SCRIPT_DIR} && git pull)\033[0m")
+    elif verdict is None:
+        print(f"\033[93m🔔 Update available: v{remote_ver} (you have v{__version__}) — signature NOT checked (no 'cryptography' installed)\033[0m")
+    else:
+        print(f"\033[91m⚠ A newer file (v{remote_ver}) is on GitHub but its signature did NOT verify — do NOT update; the repo/account may be compromised.\033[0m")
+    print()
 
 
 config = load_config()
@@ -1021,6 +1125,7 @@ def initialize_stockfish():
     """Find and initialize the Stockfish chess engine."""
 
     def find_stockfish_exe():
+        import shutil  # used in BOTH the POSIX and Windows branches below
         # Check common Linux/Mac paths first (most likely for this user)
         if platform.system() != "Windows":
             for path in ["/usr/games/stockfish", "/usr/local/bin/stockfish",
@@ -1028,7 +1133,6 @@ def initialize_stockfish():
                 if os.path.exists(path):
                     return path
             # Try which
-            import shutil
             found = shutil.which("stockfish")
             if found:
                 return found
@@ -1588,8 +1692,9 @@ class SeleniumController:
         self.board_elem = None
         self.ready = False  # True once user is logged in and game page is loaded
 
-    def launch(self, game_mode=None, playing_color="w"):
-        """Launch a Selenium-controlled Firefox and open chess.com."""
+    def launch(self, game_mode=None, playing_color="w", auto_start=True):
+        """Launch a Selenium-controlled Firefox and open chess.com.
+        auto_start=False navigates only (used by the read-only probe)."""
         from selenium import webdriver
         from selenium.webdriver.firefox.options import Options
         from selenium.webdriver.firefox.service import Service
@@ -1659,6 +1764,8 @@ class SeleniumController:
         if game_mode == "player":
             # Login flow first — no popup dismissal until logged in
             self._wait_for_login_and_play()
+            if auto_start:
+                self.setup_and_start_game()   # picks the chosen time + Start Game
             self.ready = True
         elif game_mode == "bot":
             self.driver.get('https://www.chess.com/play/computer')
@@ -1742,8 +1849,10 @@ class SeleniumController:
         import sqlite3, glob
 
         profile_dirs = [
-            os.path.expanduser("~/.mozilla/firefox"),
-            os.path.expanduser("~/snap/firefox/common/.mozilla/firefox"),
+            os.path.expanduser("~/.mozilla/firefox"),                      # Linux
+            os.path.expanduser("~/snap/firefox/common/.mozilla/firefox"),  # Linux (snap)
+            os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles"),  # Windows
+            os.path.expanduser("~/Library/Application Support/Firefox/Profiles"),  # macOS
         ]
 
         for base in profile_dirs:
@@ -1880,6 +1989,17 @@ class SeleniumController:
                             continue  # Inside login form
                         except Exception:
                             pass
+                        # NEVER click game-start buttons — chess.com's "Start Game"
+                        # and quick-pair buttons are also .cc-button-primary, so
+                        # clicking them here would auto-launch a game.
+                        try:
+                            _bt = (elem.text or "").strip().lower()
+                        except Exception:
+                            _bt = ""
+                        if any(w in _bt for w in ("start game", "play", "find game",
+                                                  "new game", "rematch", "create game",
+                                                  "challenge", "accept")):
+                            continue
                         elem.click()
                         dismissed += 1
                         time.sleep(0.5)
@@ -2144,6 +2264,75 @@ class SeleniumController:
             pass
         return ""
 
+    def select_time_control(self, tc):
+        """Open the /play/online time dropdown and click the preset matching tc
+        ('10|0', '15|10', '3 days', ...). Returns True if a preset was clicked.
+        Flow (confirmed via DOM probe): the selector is a .time-selector dropdown
+        button; presets show as 'N min', 'M + inc', or 'N day(s)'."""
+        if not tc:
+            return False
+        from selenium.webdriver.common.by import By
+        wanted = [w.lower() for w in time_control_labels(tc)]
+        try:
+            # 1) Open the dropdown (button currently shows e.g. "10 min (Rapid)")
+            for dsel in ['.time-selector-next-component button',
+                         '.cc-dropdown-button-component']:
+                btns = self.driver.find_elements(By.CSS_SELECTOR, dsel)
+                if btns and btns[0].is_displayed():
+                    self.driver.execute_script("arguments[0].click();", btns[0])
+                    time.sleep(1.0)
+                    break
+
+            # 2) Click the preset whose label matches (exact first, then substring)
+            def _click_match(exact):
+                for el in self.driver.find_elements(By.CSS_SELECTOR, 'button, [role="option"]'):
+                    try:
+                        if not el.is_displayed():
+                            continue
+                        txt = " ".join((el.text or "").split()).lower()
+                        if not txt or 'start game' in txt or '(' in txt:
+                            continue  # skip the current-selection header "10 min (Rapid)"
+                        hit = (txt in wanted) if exact else any(w in txt for w in wanted)
+                        if hit:
+                            self.driver.execute_script("arguments[0].click();", el)
+                            time.sleep(0.8)
+                            logging.info(f"Time control '{tc}' set via '{txt}'")
+                            print(f"\033[90m  Time control: {tc}\033[0m")
+                            return True
+                    except Exception:
+                        pass
+                return False
+
+            if _click_match(True) or _click_match(False):
+                return True
+        except Exception as e:
+            logging.error(f"select_time_control failed: {e}")
+        logging.info(f"Time control '{tc}' not found in dropdown — leaving default")
+        return False
+
+    def click_start_game(self):
+        """Click the green 'Start Game' quick-pair button. Returns True if clicked."""
+        from selenium.webdriver.common.by import By
+        try:
+            for el in self.driver.find_elements(By.CSS_SELECTOR, 'button.cc-button-primary, button'):
+                try:
+                    if el.is_displayed() and 'start game' in (el.text or '').strip().lower():
+                        self.driver.execute_script("arguments[0].click();", el)
+                        time.sleep(2)
+                        logging.info("Clicked Start Game")
+                        return True
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"click_start_game failed: {e}")
+        return False
+
+    def setup_and_start_game(self):
+        """Select the chosen time control (if any), then click Start Game."""
+        self.select_time_control(SELECTED_TIME_CONTROL)
+        time.sleep(0.5)
+        return self.click_start_game()
+
     def start_new_game(self):
         """Start a new game. Navigates directly to play page."""
         try:
@@ -2169,7 +2358,11 @@ class SeleniumController:
             time.sleep(5)
             self.dismiss_popups()
 
-            # Click any play/start button
+            # Select the chosen time control (if any) and start the game
+            if self.setup_and_start_game():
+                return True
+
+            # Fallback: click any play/start button
             from selenium.webdriver.common.by import By
             for attempt in range(3):
                 for sel in ['button', 'a']:
@@ -2213,6 +2406,69 @@ class SeleniumController:
             return True
         except Exception:
             return False
+
+    def get_opponent_name(self):
+        """Best-effort: read the opponent's (top player) username from the DOM."""
+        from selenium.webdriver.common.by import By
+        try:
+            for sel in ['.board-player-top [data-test-element="user-tagline-username"]',
+                        '.player-top .user-username-component',
+                        '[data-test-element="user-tagline-username"]',
+                        '.player-component .user-username-component',
+                        '.board-player-top a[href*="/member/"]']:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        t = (el.text or "").strip()
+                        if t:
+                            return t
+        except Exception:
+            pass
+        return None
+
+    def report_opponent(self):
+        """Best-effort: open chess.com's report/abuse dialog and submit a fair-play
+        report. Returns True if it looks submitted, False otherwise (caller then
+        shows manual instructions). NOTE: report DOM not yet verified — needs a probe."""
+        from selenium.webdriver.common.by import By
+        try:
+            opened = False
+            for sel in ['[aria-label*="report" i]', '[data-cy*="report"]',
+                        'button[aria-label*="flag" i]', '.flag-component button',
+                        '[class*="report"] button']:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", el)
+                        time.sleep(1)
+                        opened = True
+                        break
+                if opened:
+                    break
+            if not opened:
+                return False
+            # Choose a cheating / fair-play reason if a chooser appears
+            for el in self.driver.find_elements(By.CSS_SELECTOR, 'button, [role="option"], label, li'):
+                try:
+                    t = (el.text or "").strip().lower()
+                    if el.is_displayed() and any(w in t for w in ('cheat', 'fair play', 'engine', 'unfair')):
+                        self.driver.execute_script("arguments[0].click();", el)
+                        time.sleep(0.5)
+                        break
+                except Exception:
+                    pass
+            # Submit
+            for el in self.driver.find_elements(By.CSS_SELECTOR, 'button'):
+                try:
+                    t = (el.text or "").strip().lower()
+                    if el.is_displayed() and t in ('report', 'submit', 'send report', 'confirm'):
+                        self.driver.execute_script("arguments[0].click();", el)
+                        time.sleep(1)
+                        logging.info("Submitted opponent report")
+                        return True
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"report_opponent failed: {e}")
+        return False
 
     def close(self):
         """Close the browser and clean up geckodriver."""
@@ -2401,6 +2657,112 @@ def load_fen(filepath="current_fen.txt"):
 
 # ─── User Input ───────────────────────────────────────────────────────────────
 
+# Standard Chess.com live time controls (minutes | increment-seconds), by category.
+TIME_CONTROLS = [
+    ("Bullet", ["1|0", "1|1", "2|1"]),
+    ("Blitz",  ["3|0", "3|2", "5|0"]),
+    ("Rapid",  ["10|0", "15|10", "30|0"]),
+    ("Daily",  ["1 day", "3 days"]),
+]
+
+# Chosen time control (e.g. "10|0", "15|10", "3 days"). Set from the session in
+# monitor_chessboard, read by the Selenium game-start helpers. None = pick in browser.
+SELECTED_TIME_CONTROL = None
+
+# Whether to auto-report opponents flagged as very likely engines. Set in
+# monitor_chessboard from the session; read by maybe_report_opponent().
+AUTO_REPORT = False
+
+
+def normalize_time_control(s):
+    """Normalize a user-typed time control to canonical form.
+    Accepts '5', '5|0', '3|2', '3/2', '3+2', '1 day', '3days'. Returns str or None."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    if "day" in s:
+        num = "".join(ch for ch in s if ch.isdigit())
+        if num:
+            n = int(num)
+            return f"{n} day" if n == 1 else f"{n} days"
+        return None
+    s = s.replace(" ", "")
+    for sep in ("|", "/", "+"):
+        if sep in s:
+            a, _, b = s.partition(sep)
+            if a.isdigit() and b.isdigit():
+                return f"{int(a)}|{int(b)}"
+            return None
+    if s.isdigit():
+        return f"{int(s)}|0"
+    return None
+
+
+def time_control_labels(tc):
+    """Button labels Chess.com's time dropdown uses for a control.
+    No increment -> 'N min'; with increment -> 'M + inc'; daily -> 'N day(s)'.
+    e.g. '10|0'->['10 min']; '15|10'->['15 + 10', ...]; '3 days'->['3 days']."""
+    if not tc:
+        return []
+    tc = tc.strip().lower()
+    if "day" in tc:
+        n = "".join(ch for ch in tc if ch.isdigit()) or "1"
+        return [f"{n} days", f"{n} day"]
+    if "|" in tc:
+        m, _, inc = tc.partition("|")
+        m, inc = m.strip(), inc.strip()
+        if inc in ("0", ""):
+            return [f"{m} min", f"{m} minutes"]
+        return [f"{m} + {inc}", f"{m}+{inc}", f"{m}|{inc}", f"{m} min + {inc} sec"]
+    return [tc]
+
+
+def ask_time_control():
+    """Prompt for a time control (preset or custom). Returns canonical string."""
+    flat = []
+    print("Time control:")
+    for cat, presets in TIME_CONTROLS:
+        start = len(flat)
+        labels = "   ".join(f"[{start + i + 1}] {p}" for i, p in enumerate(presets))
+        print(f"  {cat:<7} {labels}")
+        flat.extend(presets)
+    print("  Custom  [c] type your own, e.g. 7|3 or 2 days")
+    while True:
+        choice = input(f"Choose 1-{len(flat)} or c: ").strip().lower()
+        if choice == "c":
+            tc = normalize_time_control(input("Custom (minutes|increment): "))
+            if tc:
+                return tc
+            print("Format like 5|0, 3|2, or 2 days.")
+            continue
+        if choice.isdigit() and 1 <= int(choice) <= len(flat):
+            return flat[int(choice) - 1]
+        print(f"Enter 1-{len(flat)} or c.")
+
+
+def maybe_report_opponent(game, ctrl):
+    """If auto-report is on and the opponent looks (strictly) like an engine,
+    report them to chess.com. Strict threshold to minimize false positives —
+    only fires when 'the system is sure'."""
+    if not AUTO_REPORT or not game or not getattr(game, '_opp_cpls', None):
+        return
+    cpls = game._opp_cpls
+    if len(cpls) < 10:
+        return
+    avg = sum(cpls) / len(cpls)
+    best_pct = sum(1 for c in cpls if c < 10) / len(cpls) * 100
+    if not (avg < 12 and best_pct > 80):
+        return
+    who = (ctrl.get_opponent_name() if ctrl and ctrl.is_alive() else None) or "opponent"
+    print(f"\033[91m  ⚠ Auto-report: {who} looks like an engine "
+          f"(avg CPL {avg:.0f}, {best_pct:.0f}% best over {len(cpls)} moves).\033[0m")
+    if ctrl and ctrl.is_alive() and ctrl.report_opponent():
+        print(f"\033[92m  Report submitted for {who}.\033[0m")
+    else:
+        print(f"\033[93m  Could not auto-open the report dialog — report {who} manually: "
+              f"click their name → Report → Fair Play / Cheating.\033[0m")
+
+
 def get_user_input():
     while True:
         try:
@@ -2448,7 +2810,18 @@ def get_user_input():
                     break
                 print("Enter 'y' or 'n'.")
 
-    return skill_level, use_randomizer, auto_move, game_mode, marathon
+    time_control = None
+    auto_report = False
+    if auto_move and game_mode in ("bot", "player"):
+        time_control = ask_time_control()
+        while True:
+            ar = input("Auto-report opponents that look like engines? (y/n): ").strip().lower()
+            if ar in ("y", "n"):
+                auto_report = ar == "y"
+                break
+            print("Enter 'y' or 'n'.")
+
+    return skill_level, use_randomizer, auto_move, game_mode, marathon, time_control, auto_report
 
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
@@ -2461,35 +2834,57 @@ last_game = threading.Event()    # Set = finish current game then stop marathon
 
 _terminal_settings = None
 
+def _handle_hotkey(ch):
+    """Apply a hotkey: P = pause/resume, L = last game (stop marathon after current)."""
+    if ch == 'p':
+        if paused.is_set():
+            paused.clear()
+            print("\n\033[92m▶ Resumed\033[0m")
+        else:
+            paused.set()
+            print("\n\033[93m⏸ Paused (press P to resume)\033[0m")
+    elif ch == 'l':
+        if last_game.is_set():
+            last_game.clear()
+            print("\n\033[92m↻ Marathon continues\033[0m")
+        else:
+            last_game.set()
+            print("\n\033[93m⏹ Last game — will stop after this game\033[0m")
+
+
 def keyboard_listener():
-    """Listen for hotkeys in a background thread."""
+    """Listen for hotkeys in a background thread (cross-platform)."""
     global _terminal_settings
-    import sys, select
+    import sys
+
+    # Windows: msvcrt (no termios/select on stdin)
+    if platform.system() == "Windows":
+        try:
+            import msvcrt
+        except Exception:
+            return
+        while not stop_flag.is_set():
+            try:
+                if msvcrt.kbhit():
+                    _handle_hotkey(msvcrt.getwch().lower())
+                else:
+                    time.sleep(0.1)
+            except Exception:
+                time.sleep(0.1)
+        return
+
+    # POSIX: cbreak terminal + select
+    import select
     try:
         import tty, termios
         _terminal_settings = termios.tcgetattr(sys.stdin)
         tty.setcbreak(sys.stdin.fileno())
     except Exception:
         return
-
     try:
         while not stop_flag.is_set():
             if select.select([sys.stdin], [], [], 0.5)[0]:
-                ch = sys.stdin.read(1).lower()
-                if ch == 'p':
-                    if paused.is_set():
-                        paused.clear()
-                        print("\n\033[92m▶ Resumed\033[0m")
-                    else:
-                        paused.set()
-                        print("\n\033[93m⏸ Paused (press P to resume)\033[0m")
-                elif ch == 'l':
-                    if last_game.is_set():
-                        last_game.clear()
-                        print("\n\033[92m↻ Marathon continues\033[0m")
-                    else:
-                        last_game.set()
-                        print("\n\033[93m⏹ Last game — will stop after this game\033[0m")
+                _handle_hotkey(sys.stdin.read(1).lower())
     except Exception:
         pass
     finally:
@@ -2522,8 +2917,12 @@ def signal_handler(sig, frame):
 
 
 def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
-                       game_mode=None, marathon=False):
+                       game_mode=None, marathon=False, time_control=None,
+                       auto_report=False):
     """Main monitoring loop."""
+    global SELECTED_TIME_CONTROL, AUTO_REPORT
+    SELECTED_TIME_CONTROL = time_control
+    AUTO_REPORT = auto_report
     engine = initialize_stockfish()
     current_skill = skill_level
 
@@ -2673,6 +3072,7 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                                 print(f"\033[90m  VERDICT: Strong player (avg CPL {avg:.0f})\033[0m")
                             else:
                                 print(f"\033[92m  VERDICT: Human-level (avg CPL {avg:.0f})\033[0m")
+                    maybe_report_opponent(game, selenium_controller)
                     print(f"\033[90m  ──────────────────────────\033[0m")
                     if stats['games'] > 0:
                         print(f"\033[90m  Record: {stats['wins']}W-{stats['losses']}L-{stats['draws']}D "
@@ -3153,6 +3553,7 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                     else:
                         print(f"\033[90m  VERDICT: Too few moves to judge ({len(cpls)} analyzed)\033[0m")
 
+                maybe_report_opponent(game, selenium_controller)
                 print(f"\033[90m  ──────────────────────────\033[0m")
 
                 if stats['games'] > 0:
@@ -3244,6 +3645,12 @@ if __name__ == "__main__":
     import sys
     print("\033[1m═══ Chess.com Assistant ═══\033[0m\n")
 
+    # Notify (only) if a newer, signature-verified version is on GitHub
+    try:
+        check_for_update()
+    except Exception:
+        pass
+
     # Check for -r (resume) flag
     if '-r' in sys.argv or '--resume' in sys.argv:
         session = load_session()
@@ -3253,18 +3660,21 @@ if __name__ == "__main__":
             auto_move = session['auto_move']
             game_mode = session.get('game_mode')
             marathon = session.get('marathon', False)
+            time_control = session.get('time_control')
+            auto_report = session.get('auto_report', False)
             print(f"\033[92mResuming:\033[0m skill={skill_level}, AC={'on' if use_randomizer else 'off'}, "
                   f"auto={'on' if auto_move else 'off'}, mode={game_mode or 'manual'}, "
-                  f"marathon={'on' if marathon else 'off'}")
+                  f"marathon={'on' if marathon else 'off'}, time={time_control or 'manual'}, "
+                  f"report={'on' if auto_report else 'off'}")
         else:
             print("\033[93mNo previous session found. Starting fresh.\033[0m")
-            skill_level, use_randomizer, auto_move, game_mode, marathon = get_user_input()
+            skill_level, use_randomizer, auto_move, game_mode, marathon, time_control, auto_report = get_user_input()
     else:
-        skill_level, use_randomizer, auto_move, game_mode, marathon = get_user_input()
+        skill_level, use_randomizer, auto_move, game_mode, marathon, time_control, auto_report = get_user_input()
     print()
 
     # Save session for future -r
-    save_session(skill_level, use_randomizer, auto_move, game_mode, marathon)
+    save_session(skill_level, use_randomizer, auto_move, game_mode, marathon, time_control, auto_report)
     save_config(config)
 
     if auto_move:
@@ -3277,7 +3687,7 @@ if __name__ == "__main__":
     # playing_color will be auto-detected from the board
     monitor_thread = threading.Thread(
         target=monitor_chessboard,
-        args=(None, skill_level, use_randomizer, auto_move, game_mode, marathon),
+        args=(None, skill_level, use_randomizer, auto_move, game_mode, marathon, time_control, auto_report),
     )
     monitor_thread.start()
 
