@@ -93,7 +93,7 @@ def load_session():
 # NOTE: this NEVER downloads or overwrites any file — it only tells you when a
 # newer, cryptographically-signed release exists on GitHub. Applying it is manual.
 
-__version__ = "6.0.10"  # bump on each release; the updater compares this to GitHub
+__version__ = "6.0.11"  # bump on each release; the updater compares this to GitHub
 RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
 _UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
                     "chess.comAssistant/main/chessAssistant")
@@ -1768,23 +1768,30 @@ class SeleniumController:
         opts.set_preference("dom.webdriver.enabled", False)
         opts.set_preference("useAutomationExtension", False)
         opts.set_preference("dom.disable_window_move_resize", False)
-        opts.set_preference("general.useragent.override", "")  # Use default UA
         # Disable WebRTC leak (reveals real IP behind VPN)
         opts.set_preference("media.peerconnection.enabled", False)
         # Normal browser behavior
         opts.set_preference("dom.popup_maximum", 10)
         opts.set_preference("privacy.trackingprotection.enabled", True)
 
-        self.driver = webdriver.Firefox(options=opts, service=service)
+        # Persistent profile: reuse ONE profile across runs so a by-hand login
+        # (including solving the Cloudflare Turnstile yourself) survives, instead of
+        # a fresh throwaway each launch. Uses opts.profile=FirefoxProfile(dir) to
+        # dodge the geckodriver 0.36 "-profile" preferences bug (Selenium #14652).
+        try:
+            from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
+            self.profile_dir = os.path.expanduser("~/.config/chessassistant/ff_profile")
+            os.makedirs(self.profile_dir, exist_ok=True)
+            _profile = FirefoxProfile(self.profile_dir)
+            _profile.set_preference("browser.startup.page", 3)                # restore last session
+            _profile.set_preference("browser.sessionstore.resume_from_crash", True)
+            _profile.set_preference("browser.sessionstore.max_resumed_crashes", -1)
+            opts.profile = _profile
+        except Exception as e:
+            logging.error(f"Persistent profile setup failed, using throwaway: {e}")
+            self.profile_dir = None
 
-        # Remove all automation fingerprints from navigator
-        self.driver.execute_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            window.chrome = {runtime: {}};
-            delete window.__fxdriver_unwrapped;
-        """)
+        self.driver = webdriver.Firefox(options=opts, service=service)
 
         # Position browser on the left half of the screen
         self._tile_left()
@@ -1927,42 +1934,99 @@ class SeleniumController:
                     logging.error(f"Cookie import failed: {e}")
         return False
 
+    def _cookie_store(self):
+        return os.path.expanduser("~/.config/chessassistant/chesscom_session.json")
+
+    def _save_cookies(self):
+        """Save chess.com cookies from the live session so a by-hand login
+        (incl. the one-time Turnstile solve) survives the next launch and we
+        can skip the login page entirely."""
+        try:
+            cookies = self.driver.get_cookies()
+        except Exception as e:
+            logging.error(f"_save_cookies: get_cookies failed: {e}")
+            return
+        cookies = [c for c in cookies if 'chess.com' in (c.get('domain') or '')]
+        if not cookies:
+            return
+        try:
+            path = self._cookie_store()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                json.dump(cookies, f)
+            logging.info(f"Saved {len(cookies)} chess.com cookies for next launch")
+        except Exception as e:
+            logging.error(f"_save_cookies: write failed: {e}")
+
+    def _load_cookies(self):
+        """Restore saved chess.com cookies (from a previous by-hand login) so we
+        land already logged in and never hit the login page / Turnstile."""
+        path = self._cookie_store()
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path) as f:
+                cookies = json.load(f)
+        except Exception as e:
+            logging.error(f"_load_cookies: read failed: {e}")
+            return False
+        if not cookies:
+            return False
+        try:
+            self.driver.get('https://www.chess.com')   # must be on-domain to add cookies
+            time.sleep(2)
+        except Exception:
+            pass
+        restored = 0
+        for c in cookies:
+            c.pop('sameSite', None)   # Firefox rejects some sameSite values
+            if c.get('expiry') is not None:
+                try:
+                    c['expiry'] = int(c['expiry'])
+                except Exception:
+                    c.pop('expiry', None)
+            try:
+                self.driver.add_cookie(c)
+                restored += 1
+            except Exception:
+                pass
+        logging.info(f"Restored {restored}/{len(cookies)} saved cookies")
+        return restored > 0
+
     def _wait_for_login_and_play(self):
-        """Try cookie import first, fall back to manual login."""
-        # Try to import cookies from real Firefox
-        if self._import_cookies_from_firefox():
-            self.driver.get('https://www.chess.com/home')
-            time.sleep(3)
-            url = self.driver.current_url
-            if 'login' not in url.lower():
-                print("\033[92mLogged in via cookies!\033[0m")
-                self.driver.get('https://www.chess.com/play/online')
-                time.sleep(3)
-                self.dismiss_popups()
-                return
-            print("\033[93mCookies expired, need fresh login.\033[0m")
-
-        # Fall back: open login page and wait
-        self.driver.get('https://www.chess.com/login')
-        time.sleep(2)
-
-        url = self.driver.current_url
-        if 'login' not in url.split('?')[0]:
-            print("\033[92mAlready logged in!\033[0m")
+        """Use the persistent profile: if it's already logged in from a previous
+        by-hand login, go straight to play. Otherwise wait for you to log in by
+        hand (you solve the 'Verify you are human' check yourself — that's not
+        spoofing). The session is saved to the profile on exit, so it's a one-time
+        login. NOTE: importing cookies from your normal Firefox no longer works
+        (chess.com's session isn't written to disk since Firefox 152), so we rely
+        on this profile instead."""
+        # Restore a saved session (from a previous by-hand login) so we skip
+        # the login page + Turnstile entirely.
+        self._load_cookies()
+        # Already logged in from a previous session?
+        self.driver.get('https://www.chess.com/home')
+        time.sleep(3)
+        if 'login' not in self.driver.current_url.lower():
+            print("\033[92mLogged in (saved session)!\033[0m")
+            self._save_cookies()   # refresh the saved cookies
             self.driver.get('https://www.chess.com/play/online')
             time.sleep(3)
             self.dismiss_popups()
             return
 
-        print("\033[93mPlease log in to chess.com in the browser...\033[0m")
-        print("\033[90m  (If Cloudflare blocks login here, log in on your normal Firefox first,\033[0m")
-        print("\033[90m   then restart the assistant — it will import your cookies.)\033[0m")
+        # Not logged in yet — wait for a manual, human login
+        self.driver.get('https://www.chess.com/login')
+        time.sleep(2)
+        print("\033[93mLog in — or sign up — by hand in the browser window.\033[0m")
+        print("\033[90m  Solve the 'Verify you are human' box yourself (you're human, so that's fine).\033[0m")
+        print("\033[90m  It won't start a game until you're signed in, and it saves the login for next time.\033[0m")
         while True:
             time.sleep(2)
             try:
-                url = self.driver.current_url
-                if 'login' not in url.split('?')[0]:
-                    print("\033[92mLogged in!\033[0m Navigating to play...")
+                if 'login' not in self.driver.current_url.split('?')[0]:
+                    print("\033[92mSigned in!\033[0m Saving session, navigating to play...")
+                    self._save_cookies()   # persist this login for next launch
                     self.driver.get('https://www.chess.com/play/online')
                     time.sleep(3)
                     self.dismiss_popups()
@@ -2502,6 +2566,15 @@ class SeleniumController:
 
     def close(self):
         """Close the browser and clean up geckodriver."""
+        # Save cookies while the driver is still alive (get_cookies needs it) so a
+        # by-hand login — incl. the one-time Turnstile solve — survives the next
+        # launch. Replaces the old copy-cookies.sqlite-before-quit dance, which
+        # copied the DB while Firefox still held it open (inconsistent / empty).
+        try:
+            if self.driver:
+                self._save_cookies()
+        except Exception as e:
+            logging.error(f"Session persist failed: {e}")
         try:
             if self.driver:
                 self.driver.quit()
