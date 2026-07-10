@@ -25,6 +25,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
+# When Firefox dies, Selenium/urllib3 flood the log with connection-retry WARNINGs
+# (100+ per crash). We detect and recover from a dead session ourselves, so silence
+# that noise and keep only real errors.
+for _noisy in ("urllib3", "urllib3.connectionpool", "selenium",
+               "selenium.webdriver.remote.remote_connection"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
@@ -93,7 +100,7 @@ def load_session():
 # NOTE: this NEVER downloads or overwrites any file — it only tells you when a
 # newer, cryptographically-signed release exists on GitHub. Applying it is manual.
 
-__version__ = "6.0.11"  # bump on each release; the updater compares this to GitHub
+__version__ = "6.0.12"  # bump on each release; the updater compares this to GitHub
 RELEASE_SIGNING_PUBKEY_B64 = "wtPazhR1+uBdRVNqjxZut4EbnKMzdWlfkmk+BURy9R8="
 _UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/thetrueartist/"
                     "chess.comAssistant/main/chessAssistant")
@@ -385,6 +392,7 @@ class GameState:
                           for i in range(8) for j in range(8))
             if not changed:
                 self.consecutive_same += 1
+                self._pending_move = None   # board reverted — drop any unconfirmed move
                 return "no_change"
 
         self.consecutive_same = 0
@@ -392,6 +400,7 @@ class GameState:
         # First check: does the detected board already match our current state?
         if self._boards_match(raw_board):
             self.last_raw_board = [row[:] for row in raw_board]
+            self._pending_move = None
             if self.is_our_turn:
                 return "our_turn"
             return "their_turn"
@@ -407,6 +416,14 @@ class GameState:
                 logging.info(f"Color-only match found: {move.uci()}")
 
         if move is not None:
+            # Two-frame confirmation: a transient bad read (alt-tabbing, a
+            # mid-animation frame, or the board briefly obscured) can look like a
+            # legal move. Require the SAME move on two consecutive detections before
+            # committing — fixes the "says it moved when it hasn't" tab glitch.
+            if getattr(self, '_pending_move', None) != move.uci():
+                self._pending_move = move.uci()
+                return "no_change"   # hold: don't commit or advance last_raw_board yet
+            self._pending_move = None
             self.board.push(move)
             self.move_history.append(move)
             self.last_raw_board = [row[:] for row in raw_board]
@@ -1456,26 +1473,35 @@ def get_best_move(engine, board, piece_count, use_randomizer, skill_level,
             if not best_move or not board.is_legal(best_move):
                 raise Exception("Invalid move generated")
 
-            # Select from top moves — much wider window for human-like play
+            # Select from top moves — window for human-like play
             advantage = best_score / 100
             move_num = len(board.move_stack) // 2 + 1
 
+            # When we're clearly winning, CONVERT: play accurately instead of loosening
+            # up. A human up material plays their good moves — that isn't suspicious,
+            # whereas throwing a won game (especially on time) is the most bot-like
+            # outcome there is. Camouflage (wide windows, blunders, CPL-matching) is
+            # reserved for equal/worse positions, where "too perfect" would stand out.
+            converting = advantage >= 2.5
+
             # Base window: 100-200cp (humans regularly play 1-2 pawn suboptimal)
-            if abs(advantage) > 3.0:
-                max_diff = 120 + abs(advantage) * 10  # Winning big → more slack
+            if converting:
+                max_diff = 45   # tight — near-best variety only, don't hand back the win
+            elif advantage < -3.0:
+                max_diff = 120 + abs(advantage) * 10  # losing → fight, take chances
             elif abs(advantage) > 1.5:
                 max_diff = 100 + abs(advantage) * 8
             else:
                 max_diff = 80 + entropy * 25
 
-            # Opponent-adaptive: match ~70% of their CPL
-            if opp_avg_cpl is not None and opp_avg_cpl > 30:
+            # Opponent-adaptive: match ~70% of their CPL — but never while converting a win
+            if not converting and opp_avg_cpl is not None and opp_avg_cpl > 30:
                 target_cpl = opp_avg_cpl * 0.7
                 max_diff = max(max_diff, target_cpl * 2.0)
                 max_diff = min(max_diff, 300)
 
-            # Fatigue: window widens as game goes on
-            if move_num > 20:
+            # Fatigue: window widens as game goes on — but not when converting
+            if not converting and move_num > 20:
                 max_diff *= 1.0 + (move_num - 20) * 0.02
 
             valid_moves = []
@@ -1488,16 +1514,16 @@ def get_best_move(engine, board, piece_count, use_randomizer, skill_level,
             if not valid_moves:
                 return best_move, best_score, best_score
 
-            # Blunder injection — realistic rates
+            # Blunder injection — realistic rates, but NEVER sabotage a winning position
             blunder_chance = 0.06  # Base 6% (humans blunder often)
             if move_num > 20:
                 blunder_chance += (move_num - 20) * 0.008  # +0.8% per move after 20
-            if advantage > 2.0:
-                blunder_chance += 0.06  # Overconfidence when winning
             if advantage < -2.0:
                 blunder_chance += 0.04  # Desperation when losing
+            if converting:
+                blunder_chance = 0.0   # up big → just convert, don't hand it back
 
-            if use_randomizer and random.random() < min(blunder_chance, 0.25):
+            if use_randomizer and blunder_chance > 0 and random.random() < min(blunder_chance, 0.25):
                 # Pick a "human-like" blunder: prefer captures and checks
                 # (humans blunder into tactics, not random squares)
                 all_legal = list(board.legal_moves)
@@ -1609,35 +1635,42 @@ def print_status(game_state, move=None, score=None):
 
 # ─── Skill Adjustment ─────────────────────────────────────────────────────────
 
-def adjust_skill_level(engine, current_skill, piece_count, score_diff, game=None):
+def adjust_skill_level(engine, current_skill, piece_count, score_diff, game=None,
+                       our_eval=None):
     """Dynamically adjust skill level to play slightly above opponent's level.
-    Uses opponent's average CPL to estimate their ELO and match it."""
-    min_skill = 5
+    Uses opponent's average CPL to estimate their ELO and match it. Never drops so
+    low that it hangs pieces (min 11), and holds skill HIGH while we're clearly
+    winning so a won game gets converted instead of thrown back."""
+    min_skill = 11   # was 5 — sub-10 hangs pieces and reads as broken, not human
 
     # Estimate target skill from opponent's play quality
     target_skill = current_skill
     if game and hasattr(game, '_opp_cpls') and len(game._opp_cpls) >= 3:
         avg_cpl = sum(game._opp_cpls) / len(game._opp_cpls)
-        # Map opponent CPL to our skill level (play slightly better)
-        # CPL 10-20 = engine (~2500 ELO) → skill 20
-        # CPL 30-50 = strong player (~1800) → skill 16-18
-        # CPL 50-80 = average player (~1400) → skill 12-15
-        # CPL 80-120 = weak player (~1000) → skill 8-12
-        # CPL 120+ = beginner → skill 5-8
+        # Map opponent CPL to our skill level (play slightly above them, but floored)
+        # CPL <20 = engine-level → skill 20;  higher CPL = weaker → lower skill, but
+        # never below ~12 (a floored strong-club level still won't look engine-like
+        # thanks to the move-window camouflage, and it stops throwing pieces).
         if avg_cpl < 20:
-            target_skill = 20  # They're engine-level, play max
+            target_skill = 20
         elif avg_cpl < 40:
             target_skill = random.randint(17, 20)
         elif avg_cpl < 60:
-            target_skill = random.randint(14, 18)
+            target_skill = random.randint(15, 18)
         elif avg_cpl < 90:
-            target_skill = random.randint(11, 15)
+            target_skill = random.randint(13, 16)
         elif avg_cpl < 130:
-            target_skill = random.randint(8, 13)
+            target_skill = random.randint(12, 15)
         else:
-            target_skill = random.randint(min_skill, 10)
+            target_skill = random.randint(min_skill, 14)
 
-    # Drift toward target (faster: ±2 per move)
+    # Clearly winning (>= ~2.5 pawns) → hold skill high and convert, rather than
+    # dropping to "match" a weak opponent while we're up material (that's exactly how
+    # the won games in testing got thrown).
+    if our_eval is not None and our_eval >= 250:
+        target_skill = max(target_skill, 17)
+
+    # Drift toward target (±2 per move)
     diff_to_target = target_skill - current_skill
     if abs(diff_to_target) > 3:
         step = random.randint(2, 3) * (1 if diff_to_target > 0 else -1)
@@ -1647,9 +1680,9 @@ def adjust_skill_level(engine, current_skill, piece_count, score_diff, game=None
         step = 0
     new_skill = current_skill + step
 
-    # Random variation (human-like inconsistency, 20% chance)
+    # Random variation (human-like inconsistency, 20% chance) — gentler downside
     if random.random() < 0.20:
-        new_skill += random.choice([-3, -2, -1, 1, 2, 3])
+        new_skill += random.choice([-2, -1, 1, 2, 3])
 
     new_skill = max(min_skill, min(20, new_skill))
 
@@ -1944,7 +1977,11 @@ class SeleniumController:
         try:
             cookies = self.driver.get_cookies()
         except Exception as e:
-            logging.error(f"_save_cookies: get_cookies failed: {e}")
+            # Session already gone (e.g. browser crashed) — nothing to save, skip quietly.
+            if _is_session_dead_error(e):
+                logging.info("_save_cookies: session already closed; skipping")
+            else:
+                logging.error(f"_save_cookies: get_cookies failed: {e}")
             return
         cookies = [c for c in cookies if 'chess.com' in (c.get('domain') or '')]
         if not cookies:
@@ -2276,6 +2313,15 @@ class SeleniumController:
                            'game aborted', 'victory', 'defeat', 'abandoned',
                            'white won', 'black won', 'game review']
         try:
+            # If we've landed on the post-game analysis / review page, the game is
+            # over — chess.com auto-navigates there and it has no game-over modal to
+            # find. Its URL carries /analysis or /review (a live game is /game/<id>
+            # with neither), so marathon can recover and start the next game instead
+            # of the bot sitting on the review board.
+            _url = (self.driver.current_url or '').lower()
+            if '/analysis' in _url or '/review' in _url:
+                return True, self._get_game_result_text() or "Game ended"
+
             # Quick check: "Game Review" button is the most reliable signal
             # It ONLY appears after a game ends
             for sel in ['button', 'a', '[class*="review"]']:
@@ -2501,6 +2547,46 @@ class SeleniumController:
         except Exception:
             return False
 
+    def is_game_live(self):
+        """True once a real game is actually in progress.
+
+        Signals verified against the real chess.com DOM (probed 2026-07-10, capturing
+        the full lobby -> searching -> live transition):
+          * LIVE loads at  /game/<id>  with a real opponent username and a 'Resign'
+            control, and the board gets its 'flipped' class (only then is orientation
+            correct for colour detection).
+          * LOBBY sits at  /play/online  with a 'Start Game' button and an opponent
+            literally named 'Opponent' (placeholder), and it renders BOTH clocks at a
+            static time — so neither clocks NOR a non-empty opponent name mean 'live'.
+        Fails OPEN (True) only on a DOM error so a hiccup can't deadlock the bot; the
+        move-landed re-read in the main loop is the real safety net regardless."""
+        try:
+            url = (self.driver.current_url or '').lower()
+            # /game/<id> is a LIVE game — but exclude the post-game analysis/review
+            # page, whose URL is /analysis/game/live/<id>/review (contains /game/ but
+            # is NOT playable; treating it as live sent the bot into "analysis mode").
+            if '/game/' in url and '/analysis' not in url and '/review' not in url:
+                return True
+            # Still on /play/online etc. — require a positive in-game signal.
+            return bool(self.driver.execute_script(r"""
+                // A Resign / Abort control exists only in a live game.
+                var rc = document.querySelector(
+                    '[aria-label*="Resign" i],[aria-label*="Abort" i],[data-cy="resign"]');
+                if (rc && rc.offsetParent !== null) return true;
+                // A matched opponent's REAL username (the lobby shows the literal
+                // placeholder "Opponent", so that doesn't count).
+                var e = document.querySelector(
+                    '.board-player-top [class*="username"],.player-top [class*="username"],'
+                    + '.board-player-top a[href*="/member/"]');
+                if (e && e.offsetParent !== null) {
+                    var t = (e.textContent || '').trim().toLowerCase();
+                    if (t && t !== 'opponent' && t.length > 1) return true;
+                }
+                return false;
+            """))
+        except Exception:
+            return True
+
     def get_opponent_name(self):
         """Best-effort: read the opponent's (top player) username from the DOM."""
         from selenium.webdriver.common.by import By
@@ -2642,59 +2728,67 @@ def detect_playing_color(image, board_bounds):
 
 
 def _detect_color_from_dom(ctrl):
-    """Detect playing color from chess.com's DOM. Returns 'w', 'b', or None."""
-    from selenium.webdriver.common.by import By
+    """Detect playing colour from chess.com's DOM. Returns 'w', 'b', or None.
+
+    Uses board GEOMETRY rather than any class name (chess.com renames those):
+      1. Each piece's class encodes its colour ('wp'..'wk' / 'bp'..'bk') and it has a
+         real screen position. If White's pieces are drawn at the TOP of the board,
+         we're looking from Black's side -> we're Black. (Primary — always available.)
+      2. The 'square-FR' class encodes absolute file/rank; if higher ranks (Black's
+         home) render at the top, it's White's view. (Backup.)
+      3. Explicit 'flipped' class / orientation='black' attribute. (Last resort.)
+    """
     try:
-        # Method 1: chess.com's board element has a 'flipped' class when playing black
-        for sel in ['wc-chess-board', '.board', 'chess-board']:
-            elems = ctrl.driver.find_elements(By.CSS_SELECTOR, sel)
-            for elem in elems:
-                classes = elem.get_attribute('class') or ''
-                if 'flipped' in classes.lower():
-                    return 'b'
-                # Also check the 'orientation' attribute
-                orientation = elem.get_attribute('orientation')
-                if orientation == 'black':
-                    return 'b'
-                elif orientation == 'white':
-                    return 'w'
-
-        # Method 2: Check coordinate labels — 'a' file on left = white, on right = black
-        # The bottom-left coordinate on chess.com shows '1' for white, '8' for black
-        for sel in ['.coordinates-row .coordinate', '.coordinate-light', '.coordinate-dark']:
-            elems = ctrl.driver.find_elements(By.CSS_SELECTOR, sel)
-            if elems:
-                first_text = elems[0].text.strip()
-                if first_text == '8':
-                    return 'b'
-                elif first_text == '1':
-                    return 'w'
-
-        # Method 3: Check the board element's inline style or data attributes
-        board = ctrl.driver.execute_script("""
-            let b = document.querySelector('wc-chess-board');
-            if (b) return b.getAttribute('flipped') || b.className;
-            return '';
-        """)
-        if board and 'flipped' in str(board).lower():
-            return 'b'
-
-        # Method 4: Check which player name is at the bottom
-        bottom_player = ctrl.driver.execute_script("""
-            let els = document.querySelectorAll('.player-component, .board-player-default');
-            if (els.length >= 2) {
-                let last = els[els.length - 1];
-                let rect = last.getBoundingClientRect();
-                let board = document.querySelector('wc-chess-board, .board');
-                if (board) {
-                    let bRect = board.getBoundingClientRect();
-                    return rect.top > bRect.top + bRect.height / 2 ? 'bottom' : 'top';
-                }
+        # 1) Piece-colour geometry — which side's men sit at the top of the board?
+        color = ctrl.driver.execute_script("""
+            var b = document.querySelector('wc-chess-board')
+                    || document.querySelector('chess-board') || document.querySelector('.board');
+            if (!b) return '';
+            var pieces = b.querySelectorAll('.piece');
+            var wy = [], by = [];
+            for (var i = 0; i < pieces.length; i++) {
+                var cls = pieces[i].getAttribute('class') || '';
+                var top = pieces[i].getBoundingClientRect().top;
+                if (/(^|\\s)w[pnbrqk](\\s|$)/.test(cls)) wy.push(top);
+                else if (/(^|\\s)b[pnbrqk](\\s|$)/.test(cls)) by.push(top);
             }
+            if (!wy.length || !by.length) return '';
+            var mean = function(a){ var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; };
+            return mean(wy) < mean(by) ? 'b' : 'w';  // white men higher up => we view from Black
+        """)
+        if color in ('w', 'b'):
+            return color
+        # 2) square-FR rank geometry — higher rank drawn higher on screen => White's view
+        color = ctrl.driver.execute_script("""
+            var b = document.querySelector('wc-chess-board')
+                    || document.querySelector('chess-board') || document.querySelector('.board');
+            if (!b) return '';
+            var pieces = b.querySelectorAll('.piece'), pts = [];
+            for (var i = 0; i < pieces.length; i++) {
+                var m = (pieces[i].getAttribute('class') || '').match(/square-(\\d)(\\d)/);
+                if (m) pts.push([parseInt(m[2]), pieces[i].getBoundingClientRect().top]);
+            }
+            if (pts.length < 2) return '';
+            pts.sort(function(a, b){ return a[0] - b[0]; });
+            var lo = pts[0], hi = pts[pts.length - 1];
+            if (lo[0] === hi[0]) return '';
+            return (hi[1] < lo[1]) ? 'w' : 'b';
+        """)
+        if color in ('w', 'b'):
+            return color
+        # 3) Explicit flipped class / orientation attribute
+        flip = ctrl.driver.execute_script("""
+            var b = document.querySelector('wc-chess-board')
+                    || document.querySelector('chess-board') || document.querySelector('.board');
+            if (!b) return '';
+            var cls = ((b.className||'') + ' ' + (b.getAttribute('class')||'')).toLowerCase();
+            var orient = (b.getAttribute('orientation')||'').toLowerCase();
+            if (cls.indexOf('flipped') !== -1 || orient === 'black') return 'b';
+            if (orient === 'white') return 'w';
             return '';
         """)
-        # The bottom player is us — check their color from the page
-        # If we can't determine, return None
+        if flip in ('w', 'b'):
+            return flip
     except Exception as e:
         logging.error(f"DOM color detection failed: {e}")
     return None
@@ -3019,6 +3113,69 @@ def signal_handler(sig, frame):
     os._exit(0)
 
 
+def _is_session_dead_error(exc):
+    """True when an exception means the Firefox/geckodriver session is gone — i.e.
+    we should restart the browser rather than keep retrying the call. Matches the
+    connection-refused / invalid-session errors Selenium raises after a crash."""
+    s = f"{type(exc).__name__} {exc}".lower()
+    return any(k in s for k in (
+        'invalid session id', 'invalidsessionid', 'no such window',
+        'unable to connect', 'connection refused', 'newconnectionerror',
+        'maxretryerror', 'remotedisconnected', 'failed to establish',
+        'connection reset', 'session deleted', 'browser has closed',
+        'tried to run command without establishing a connection',
+    ))
+
+
+def _recover_browser(old_ctrl, game_mode, playing_color, max_attempts=3):
+    """Tear down a dead/broken Selenium session and bring a fresh one back up,
+    reusing the saved chess.com session so we land logged in again. Relaunches
+    with a new game so marathon play resumes — the game that was live when the
+    browser died is unavoidably forfeited on time and can't be rejoined once it
+    has flagged. Returns a live SeleniumController, or None if it can't recover
+    after max_attempts."""
+    try:
+        if old_ctrl:
+            old_ctrl.close()
+    except Exception:
+        pass
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ctrl = SeleniumController()
+            ctrl.launch(game_mode=game_mode, playing_color=playing_color or "w")
+            ctrl.ready = True
+            return ctrl
+        except Exception as e:
+            logging.error(f"Browser relaunch attempt {attempt}/{max_attempts} failed: {e}")
+            print(f"\033[93m  relaunch attempt {attempt}/{max_attempts} failed; retrying...\033[0m")
+            time.sleep(min(4 * attempt, 15))
+    return None
+
+
+def _boards_equal(a, b):
+    """Exact 8x8 equality of two raw detected boards."""
+    try:
+        return all(a[i][j] == b[i][j] for i in range(8) for j in range(8))
+    except Exception:
+        return False
+
+
+def _reread_raw_board(board_bounds, piece_templates, playing_color):
+    """Capture the screen and extract the current raw 8x8 board (or None on failure).
+    Used to confirm our auto-move actually registered on the real board before we
+    commit to it internally."""
+    try:
+        path = capture_screenshot(None)
+        img = cv2.imread(path)
+        if img is None:
+            return None
+        board, _, _ = extract_board_from_image(img, piece_templates, board_bounds, playing_color)
+        return board
+    except Exception as e:
+        logging.error(f"_reread_raw_board failed: {e}")
+        return None
+
+
 def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                        game_mode=None, marathon=False, time_control=None,
                        auto_report=False):
@@ -3074,30 +3231,28 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
         try:
             cycle_count += 1
 
-            # Check if browser is still alive — restart if crashed
+            # Check if browser is still alive — recover if it crashed
             if selenium_controller and not selenium_controller.is_alive():
-                print("\033[91mBrowser crashed. Restarting...\033[0m")
-                try:
-                    selenium_controller.close()
-                except Exception:
-                    pass
-                try:
-                    selenium_controller = SeleniumController()
-                    selenium_controller.launch(game_mode=game_mode, playing_color=playing_color or "w")
-                    selenium_controller.ready = True
-                    board_bounds = None
-                    board_bounds_screen = None
-                    playing_color = None
-                    game = None
-                    detection_failures = 0
-                    print("\033[92mBrowser restarted.\033[0m")
-                    print("\nWaiting for chessboard...")
-                    time.sleep(3)
-                    continue
-                except Exception as e:
-                    print(f"\033[91mBrowser restart failed: {e}\033[0m")
+                print("\033[91mBrowser crashed — recovering...\033[0m")
+                if game is not None and game.move_history:
+                    print("\033[93m  (the in-progress game flags on time — starting fresh)\033[0m")
+                    logging.info("Browser died mid-game; that game is forfeited on time.")
+                new_ctrl = _recover_browser(selenium_controller, game_mode, playing_color)
+                if new_ctrl is None:
+                    print("\033[91mCould not bring the browser back after several tries — stopping.\033[0m")
+                    selenium_controller = None
                     action_queue.put("game_over")
                     break
+                selenium_controller = new_ctrl
+                board_bounds = None
+                board_bounds_screen = None
+                playing_color = None
+                game = None
+                detection_failures = 0
+                uncertain_count = 0
+                print("\033[92mBrowser back up.\033[0m\nWaiting for chessboard...")
+                time.sleep(3)
+                continue
 
             # Check for game over FIRST every cycle (before board detection)
             if selenium_controller and selenium_controller.is_alive() and game is not None:
@@ -3252,6 +3407,29 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
 
             # Report board detection (first time, or if size/position changed significantly)
             if board_bounds is None:
+                # Wait for the game to actually be LIVE before detecting colour or
+                # moving. Otherwise, as White, the loop fires move 1 into the
+                # matchmaking / countdown screen — and reads colour off the pre-game
+                # board (which flips when you're assigned Black) — then desyncs and
+                # hangs. Only online play has this race; bot/watch start instantly.
+                # Bounded wait (~25s) so a DOM-selector miss degrades to old behaviour
+                # instead of deadlocking.
+                if (game_mode == "player" and game is None
+                        and selenium_controller and selenium_controller.is_alive()):
+                    if selenium_controller.is_game_live():
+                        selenium_controller._live_wait = 0
+                    else:
+                        waited = getattr(selenium_controller, '_live_wait', 0) + 1
+                        selenium_controller._live_wait = waited
+                        if waited <= 25:
+                            if waited == 1:
+                                print("\033[90m  Waiting for the game to start...\033[0m")
+                            logging.info("Board detected but game not live yet — waiting")
+                            time.sleep(1.0)
+                            continue
+                        logging.info("Game-live wait timed out — proceeding anyway")
+                        selenium_controller._live_wait = 0
+
                 print(f"\033[92mBoard found:\033[0m {bw}x{bh} at ({bx},{by}), "
                       f"cell={bw//8}x{bh//8}px")
 
@@ -3276,17 +3454,16 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                             dom_color = _detect_color_from_dom(selenium_controller)
                         cv_color = detect_playing_color(full_image, detected)
 
-                        # If both agree, use that
-                        if dom_color and cv_color and dom_color == cv_color:
+                        # DOM board orientation is the ground truth — trust it first.
+                        # (The CV colour read can misjudge which side is at the bottom,
+                        # especially when black pieces are hard to classify — that's the
+                        # "detected White when I was Black" bug.)
+                        if dom_color:
                             playing_color = dom_color
                             break
-                        # If only CV detected (DOM might not have game yet)
-                        if cv_color and attempt >= 3:
+                        # Fall back to the CV read only if the DOM can't tell us yet
+                        if cv_color and attempt >= 2:
                             playing_color = cv_color
-                            break
-                        # If only DOM detected and we've waited enough
-                        if dom_color and attempt >= 4:
-                            playing_color = dom_color
                             break
 
                     if playing_color is None:
@@ -3527,21 +3704,35 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
 
                     if auto_move and board_bounds_screen:
                         if execute_move_on_screen(move, board_bounds_screen, playing_color):
-                            game.board.push(move)
-                            game.move_history.append(move)
-                            game.is_our_turn = False
-                            # DON'T clear last_raw_board — this prevents phantom piece sync.
-                            # Instead, set a flag to skip FEN sync for the next few cycles
-                            # (only use _boards_match and find_matching_move, not the fallback sync)
-                            game._skip_sync_cycles = 9999  # Never use FEN sync after auto-move
-                            logging.info(f"Auto-played: {move.uci()}")
-                            # Wait for animation to settle
-                            time.sleep(1.0)
+                            time.sleep(1.0)   # let the move animation settle
+                            # Verify the move actually landed before committing. If the
+                            # board is UNCHANGED from just before we "moved", the click
+                            # went nowhere (game not live yet / click missed) — so DON'T
+                            # pretend we moved (that's the "thinks it moved when it hasn't"
+                            # hang). We reject ONLY on an exact match to the pre-move board,
+                            # so a real move (which changes the board) is never rejected.
+                            pre_move = game.last_raw_board
+                            fresh = _reread_raw_board(board_bounds, piece_templates, playing_color)
+                            if (fresh is not None and pre_move is not None
+                                    and _boards_equal(fresh, pre_move)):
+                                logging.warning(f"Move {move.uci()} didn't register "
+                                                f"(board unchanged) — not committing")
+                                print("\033[93m  Move didn't register (game not live?) — retrying...\033[0m")
+                                time.sleep(1.0)
+                            else:
+                                game.board.push(move)
+                                game.move_history.append(move)
+                                game.is_our_turn = False
+                                # DON'T clear last_raw_board — this prevents phantom piece
+                                # sync. Skip FEN sync for the rest of the game.
+                                game._skip_sync_cycles = 9999
+                                logging.info(f"Auto-played: {move.uci()}")
                         else:
                             logging.error("Auto-move failed, showing move instead")
 
                     current_skill = adjust_skill_level(
-                        engine, current_skill, game.piece_count, diff, game
+                        engine, current_skill, game.piece_count, diff, game,
+                        our_eval=best_score,
                     )
                 else:
                     logging.error("Failed to get best move")
@@ -3687,28 +3878,27 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
 
         except Exception as e:
             logging.error(f"Error in main loop: {e}")
-            # Check if this is a browser crash
-            if selenium_controller and not selenium_controller.is_alive():
-                print("\033[91mBrowser crashed. Restarting...\033[0m")
-                try:
-                    selenium_controller.close()
-                except Exception:
-                    pass
-                try:
-                    selenium_controller = SeleniumController()
-                    selenium_controller.launch(game_mode=game_mode, playing_color=playing_color or "w")
-                    selenium_controller.ready = True
-                    board_bounds = None
-                    board_bounds_screen = None
-                    playing_color = None
-                    game = None
-                    detection_failures = 0
-                    print("\033[92mBrowser restarted.\033[0m\nWaiting for chessboard...")
-                    time.sleep(3)
-                except Exception as e2:
-                    print(f"\033[91mRestart failed: {e2}\033[0m")
+            # Recover if the browser died — either it reads as dead, or the error that
+            # just fired is itself a dead-session/connection error from a call that
+            # raced the crash (kills the retry-storm-then-hang path).
+            if selenium_controller and (not selenium_controller.is_alive()
+                                        or _is_session_dead_error(e)):
+                print("\033[91mBrowser crashed — recovering...\033[0m")
+                new_ctrl = _recover_browser(selenium_controller, game_mode, playing_color)
+                if new_ctrl is None:
+                    print("\033[91mCould not bring the browser back after several tries — stopping.\033[0m")
+                    selenium_controller = None
                     action_queue.put("game_over")
                     break
+                selenium_controller = new_ctrl
+                board_bounds = None
+                board_bounds_screen = None
+                playing_color = None
+                game = None
+                detection_failures = 0
+                uncertain_count = 0
+                print("\033[92mBrowser back up.\033[0m\nWaiting for chessboard...")
+                time.sleep(3)
             else:
                 time.sleep(2)
 

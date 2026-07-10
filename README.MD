@@ -14,7 +14,8 @@
   - Randomized depth, exponential move-weighting, occasional lazy/blunder moves
   - Dynamic skill adjustment that estimates the opponent's strength (from their centipawn loss) and plays *slightly* above them
   - Built-in opening book for the first several moves
-- 🔐 **Auto-login** — imports your Chess.com cookies from your real Firefox profile (falls back to manual login).
+- 🔐 **Session persistence** — you log in by hand once in the Selenium browser (solving Chess.com's human-check yourself); it saves that session and reuses it, so later runs start already logged in and skip the login page.
+- 🔄 **Signed self-update** — checks GitHub at startup and, if a newer release exists, verifies its Ed25519 signature against a key baked into the app before offering to install it.
 - 📊 **Opponent analysis** — tracks the opponent's average centipawn loss and flags likely engine users.
 - 🎮 **Modes & marathon**
   - Play vs **bots**, vs **online players**, or **watch** (suggest-only)
@@ -42,6 +43,7 @@ selenium
 pyautogui                 # X11 fallback
 psutil
 pillow
+cryptography              # verifies signed self-updates
 ```
 > No `torch` / `torchvision` anymore — the vision pipeline is pure OpenCV now.
 
@@ -62,7 +64,7 @@ sudo snap install geckodriver              # or grab it from the Mozilla release
 python3 chessAssistant.py        # then answer the prompts
 python3 chessAssistant.py -r     # resume last session
 ```
-You'll be asked for the skill level, whether to use the anti-detection randomizer, whether to auto-move, the mode (bots / players / watch), and marathon on/off. Settings are saved to `config.json` and `last_session.json`.
+You'll be asked for the skill level, whether to use the anti-detection randomizer, whether to auto-move, the mode (bots / players / watch), the time control (a standard one like `15|10` or a custom `M|inc` / days), and marathon on/off. Settings are saved to `config.json` and `last_session.json`.
 
 ## Notes 🗒️
 - **Ideal layout:** Chess.com on the **left half** of the screen, terminal on the **right**. Works best at **1440p** on the **default Chess.com theme**.
