@@ -59,6 +59,13 @@ sudo snap install geckodriver              # or grab it from the Mozilla release
 ```
 **Windows:** download Stockfish from https://stockfishchess.org/download/ and geckodriver from the Mozilla `geckodriver` releases page.
 
+### Or let it install itself 🪄
+On first run, if anything's missing the app **offers to set it up for you** — Python packages via `pip` (PyPI), plus **Stockfish** and **geckodriver** as **SHA256-verified official downloads** (from `github.com/official-stockfish` and `github.com/mozilla`) into `~/.config/chessassistant/bin/`. No admin/sudo, and it only ever pulls from those official hosts. Run it up front anytime with:
+```bash
+python3 chessAssistant.py --setup
+```
+(Firefox itself isn't auto-installed — it just points you to mozilla.org if it's missing.)
+
 ## Usage ▶️
 ```bash
 python3 chessAssistant.py        # then answer the prompts
