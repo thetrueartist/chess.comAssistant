@@ -2886,6 +2886,23 @@ class SeleniumController:
         except Exception:
             return True
 
+    def whose_turn(self):
+        """Whose move it is, straight from chess.com's active-clock marker: the active
+        player's clock carries the 'clock-player-turn' class, and the bottom clock is
+        always ours (verified against the live DOM). Returns 'us', 'them', or None.
+        This is the reliable signal for catching a tracking desync — if the DOM says
+        it's our move but the bot thinks it's the opponent's, we missed their move."""
+        try:
+            r = self.driver.execute_script(r"""
+                function vis(e){ return e && e.offsetParent !== null; }
+                if (vis(document.querySelector('.clock-bottom.clock-player-turn'))) return 'us';
+                if (vis(document.querySelector('.clock-top.clock-player-turn')))    return 'them';
+                return '';
+            """)
+            return r if r in ('us', 'them') else None
+        except Exception:
+            return None
+
     def get_opponent_name(self):
         """Best-effort: read the opponent's (top player) username from the DOM."""
         from selenium.webdriver.common.by import By
@@ -3831,6 +3848,30 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                 no_change_count = getattr(game, '_no_change_count', 0) + 1 if game else 0
                 if game:
                     game._no_change_count = no_change_count
+
+                # Desync guard (reliable): we think we're waiting for the opponent, but
+                # if chess.com's active-clock says it's OUR move, we missed their move —
+                # re-sync and play instead of sitting here until we flag on time (this is
+                # what threw the +20 game). Requires the DOM to say 'our turn' for several
+                # consecutive reads so a normal just-moved lag (detection catching up)
+                # doesn't trip it. Uses the whose_turn() clock marker, not a clock-delta.
+                if (game and not game.is_our_turn and no_change_count >= 2
+                        and selenium_controller and selenium_controller.is_alive()):
+                    if selenium_controller.whose_turn() == 'us':
+                        game._turn_desync = getattr(game, '_turn_desync', 0) + 1
+                    else:
+                        game._turn_desync = 0
+                    if getattr(game, '_turn_desync', 0) >= 4:
+                        logging.info("Active-clock says it's our move but we were waiting — "
+                                     "missed the opponent's move; re-syncing")
+                        print("\033[93m  Missed a move (clock shows it's our turn) — re-syncing...\033[0m")
+                        game.is_our_turn = True
+                        game._skip_sync_cycles = 0
+                        game.force_sync(current_board)
+                        game._turn_desync = 0
+                        game._no_change_count = 0
+                        uncertain_count = 0
+                        continue
 
                 # Show alive indicator every 10 cycles (~5s)
                 if no_change_count % 10 == 0 and game and not game.is_our_turn:
