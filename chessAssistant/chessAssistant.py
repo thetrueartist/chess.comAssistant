@@ -1,5 +1,62 @@
 import os
 import platform
+import sys
+
+# ── Dependency bootstrap ──────────────────────────────────────────────────────
+# Runs BEFORE the third-party imports below. If the Python packages the app needs
+# aren't installed, offer to install them from PyPI via pip (official + hash-
+# verified by pip). Opt-in, no sudo. Binaries (Stockfish/geckodriver) are handled
+# on demand later by ensure_stockfish()/ensure_geckodriver(). Skip with the env
+# var CHESSASSIST_NO_BOOTSTRAP=1.
+def _bootstrap_python_deps():
+    deps = {  # import-name : pip-name
+        "cv2": "opencv-python", "numpy": "numpy", "chess": "python-chess",
+        "selenium": "selenium", "psutil": "psutil", "PIL": "pillow",
+        "cryptography": "cryptography", "pyautogui": "pyautogui",
+    }
+    if platform.system() != "Windows":
+        deps["pyscreenshot"] = "pyscreenshot"
+    import importlib.util
+
+    def have(mod):
+        try:
+            return importlib.util.find_spec(mod) is not None
+        except Exception:
+            return False
+
+    missing = sorted({pip for mod, pip in deps.items() if not have(mod)})
+    if not missing:
+        return
+    print("\033[93mMissing Python packages:\033[0m " + ", ".join(missing))
+    try:
+        ans = input("Install them now from PyPI (pip)? [Y/n]: ").strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans not in ("", "y", "yes"):
+        print("Skipping — the app may not start (pip install " + " ".join(missing) + ").")
+        return
+    import subprocess
+    base = [sys.executable, "-m", "pip", "install"]
+    for extra in ([], ["--user"], ["--break-system-packages"]):
+        try:
+            subprocess.check_call(base + extra + missing)
+            break
+        except Exception:
+            continue
+    if any(not have(mod) for mod, pip in deps.items() if pip in missing):
+        print("\033[91mCould not install some packages\033[0m — install manually and re-run.")
+        sys.exit(1)
+    # Re-launch so the freshly installed packages import cleanly (POSIX). On
+    # Windows, execv garbles the console, so ask for a manual restart instead.
+    if platform.system() == "Windows" or os.environ.get("_CHESSASSIST_REEXEC") == "1":
+        print("\033[92mDependencies installed — please run the script again.\033[0m")
+        sys.exit(0)
+    os.environ["_CHESSASSIST_REEXEC"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+if os.environ.get("CHESSASSIST_NO_BOOTSTRAP") != "1":
+    _bootstrap_python_deps()
+
 import cv2
 import numpy as np
 if platform.system() == "Windows":
@@ -1144,6 +1201,246 @@ def are_images_similar(image1_path, image2_path, threshold=0.05):
 
 # ─── Stockfish Engine ─────────────────────────────────────────────────────────
 
+# ── Official binary setup: Stockfish + geckodriver ────────────────────────────
+# Auto-installs the two native binaries the app needs, on demand, when they aren't
+# already present. Downloads ONLY from official hosts, SHA256-verified against the
+# GitHub release API's per-asset digest, into a local userspace dir (no sudo).
+_SETUP_BIN_DIR = os.path.expanduser("~/.config/chessassistant/bin")
+_OFFICIAL_HOSTS = ("github.com", "api.github.com", "objects.githubusercontent.com",
+                   "codeload.github.com", "pypi.org", "files.pythonhosted.org")
+_EXE = ".exe" if platform.system() == "Windows" else ""
+
+
+def _host_ok(url):
+    from urllib.parse import urlparse
+    h = (urlparse(url).hostname or "").lower()
+    return any(h == d or h.endswith("." + d) for d in _OFFICIAL_HOSTS)
+
+
+def _confirm_setup(msg):
+    try:
+        return input(msg + " [Y/n]: ").strip().lower() in ("", "y", "yes")
+    except EOFError:
+        return False
+
+
+def _download_verified(url, sha256, dest):
+    """Download `url` (official hosts only) to `dest`, verifying SHA256 if given."""
+    import urllib.request, hashlib
+    if not _host_ok(url):
+        raise ValueError(f"refusing non-official host: {url}")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    h = hashlib.sha256()
+    tmp = dest + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": "chessAssistant-setup"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+        for chunk in iter(lambda: r.read(65536), b""):
+            h.update(chunk)
+            f.write(chunk)
+    if sha256 and h.hexdigest().lower() != sha256.lower():
+        os.remove(tmp)
+        raise ValueError(f"SHA256 mismatch for {os.path.basename(dest)}")
+    os.replace(tmp, dest)
+    return dest
+
+
+def _gh_release(repo, tag):
+    """Fetch a GitHub release via the official API. tag e.g. 'tags/sf_18' or 'latest'."""
+    import urllib.request, json
+    url = f"https://api.github.com/repos/{repo}/releases/{tag}"
+    req = urllib.request.Request(url, headers={"User-Agent": "chessAssistant-setup",
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def _pick_asset(rel, predicate):
+    for a in rel.get("assets", []):
+        if predicate(a["name"]):
+            sha = (a.get("digest") or "").split(":")[-1] or None
+            return a["browser_download_url"], sha, a["name"]
+    return None, None, None
+
+
+def _extract_binary(archive, name_contains, dest):
+    """Extract archive (.tar/.tar.gz/.zip), find the executable whose name contains
+    `name_contains`, copy it to `dest` (+x), and clean up. Returns dest or None."""
+    import tarfile, zipfile, stat, tempfile, shutil
+    tmpd = tempfile.mkdtemp(prefix="chessassist_setup_")
+    try:
+        if archive.endswith((".tar.gz", ".tgz", ".tar")):
+            with tarfile.open(archive) as t:
+                t.extractall(tmpd)
+        elif archive.endswith(".zip"):
+            with zipfile.ZipFile(archive) as z:
+                z.extractall(tmpd)
+        else:
+            return None
+        best = None
+        for root, _, files in os.walk(tmpd):
+            for f in files:
+                lf = f.lower()
+                if name_contains not in lf:
+                    continue
+                if lf.endswith((".nnue", ".txt", ".md", ".zip", ".tar", ".gz", ".ini", ".html")):
+                    continue
+                p = os.path.join(root, f)
+                if best is None or os.path.getsize(p) > os.path.getsize(best):
+                    best = p
+        if not best:
+            return None
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(best, dest)
+        os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return dest
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+        try:
+            os.remove(archive)
+        except Exception:
+            pass
+
+
+def _works_uci(exe):
+    """True if the binary speaks UCI (weeds out a wrong-CPU 'illegal instruction' build)."""
+    import subprocess
+    try:
+        p = subprocess.run([exe], input="uci\nquit\n", capture_output=True,
+                           text=True, timeout=10)
+        return "uciok" in (p.stdout + p.stderr).lower()
+    except Exception:
+        return False
+
+
+def _cpu_stockfish_variant():
+    """Best Stockfish build the CPU supports: avx2 > sse41-popcnt > base (Linux via
+    /proc/cpuinfo; assume avx2 elsewhere — a run-test falls back if that's wrong)."""
+    try:
+        if platform.system() == "Linux":
+            with open("/proc/cpuinfo") as f:
+                flags = f.read().lower()
+            if "avx2" in flags:
+                return "avx2"
+            if "sse4_1" in flags and "popcnt" in flags:
+                return "sse41-popcnt"
+            return ""  # base
+    except Exception:
+        pass
+    return "avx2"
+
+
+def ensure_stockfish():
+    """Return a path to a working Stockfish, downloading the official sf_18 build
+    (SHA256-verified) into the local bin dir if none is installed. None on decline/fail."""
+    dest = os.path.join(_SETUP_BIN_DIR, "stockfish" + _EXE)
+    if os.path.exists(dest) and _works_uci(dest):
+        return dest
+    system = platform.system()
+    namer = {
+        "Linux":   lambda v: f"stockfish-ubuntu-x86-64{('-' + v) if v else ''}.tar",
+        "Windows": lambda v: f"stockfish-windows-x86-64{('-' + v) if v else ''}.zip",
+        "Darwin":  lambda v: ("stockfish-macos-m1-apple-silicon.tar"
+                              if platform.machine().lower() in ("arm64", "aarch64")
+                              else f"stockfish-macos-x86-64{('-' + v) if v else ''}.tar"),
+    }.get(system)
+    if not namer:
+        print("Auto-download of Stockfish isn't supported on this OS."); return None
+    print("\033[93mStockfish not found.\033[0m")
+    if not _confirm_setup("Download official Stockfish 18 (github.com/official-stockfish, SHA256-verified)?"):
+        return None
+    try:
+        rel = _gh_release("official-stockfish/Stockfish", "tags/sf_18")
+    except Exception as e:
+        print(f"  couldn't reach the release API: {e}"); return None
+    order = []
+    for v in (_cpu_stockfish_variant(), "avx2", "sse41-popcnt", ""):
+        if v not in order:
+            order.append(v)
+    for v in order:
+        want = namer(v)
+        url, sha, name = _pick_asset(rel, lambda n, w=want: n == w)
+        if not url:
+            continue
+        try:
+            print(f"  downloading {name} ...")
+            arc = _download_verified(url, sha, os.path.join(_SETUP_BIN_DIR, name))
+            exe = _extract_binary(arc, "stockfish", dest)
+            if exe and _works_uci(exe):
+                print(f"\033[92mStockfish ready:\033[0m {exe}")
+                return exe
+            print(f"  {name} didn't run on this CPU — trying a more compatible build...")
+        except Exception as e:
+            print(f"  {name} failed: {e}")
+    print("Stockfish auto-setup failed."); return None
+
+
+def ensure_geckodriver():
+    """Return a path to geckodriver, downloading the latest official Mozilla build
+    (SHA256-verified) into the local bin dir if none is installed. None on decline/fail."""
+    dest = os.path.join(_SETUP_BIN_DIR, "geckodriver" + _EXE)
+    if os.path.exists(dest):
+        return dest
+    system, mach = platform.system(), platform.machine().lower()
+    if system == "Linux":
+        key = "linux64" if mach in ("x86_64", "amd64") else "linux-aarch64"
+    elif system == "Windows":
+        key = "win64" if mach in ("amd64", "x86_64") else "win32"
+    elif system == "Darwin":
+        key = "macos-aarch64" if mach in ("arm64", "aarch64") else "macos"
+    else:
+        return None
+    print("\033[93mgeckodriver not found.\033[0m")
+    if not _confirm_setup("Download official geckodriver (github.com/mozilla, SHA256-verified)?"):
+        return None
+    try:
+        rel = _gh_release("mozilla/geckodriver", "latest")
+    except Exception as e:
+        print(f"  couldn't reach the release API: {e}"); return None
+    url, sha, name = _pick_asset(
+        rel, lambda n: n.endswith(f"-{key}.tar.gz") or n.endswith(f"-{key}.zip"))
+    if not url:
+        print("  no matching geckodriver asset found."); return None
+    try:
+        print(f"  downloading {name} ...")
+        arc = _download_verified(url, sha, os.path.join(_SETUP_BIN_DIR, name))
+        exe = _extract_binary(arc, "geckodriver", dest)
+        if exe:
+            print(f"\033[92mgeckodriver ready:\033[0m {exe}")
+            return exe
+    except Exception as e:
+        print(f"  geckodriver setup failed: {e}")
+    return None
+
+
+def _firefox_present():
+    if platform.system() == "Windows":
+        cands = [os.path.join(os.environ.get("PROGRAMFILES", ""), "Mozilla Firefox", "firefox.exe"),
+                 os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Mozilla Firefox", "firefox.exe")]
+    elif platform.system() == "Darwin":
+        cands = ["/Applications/Firefox.app/Contents/MacOS/firefox"]
+    else:
+        cands = ["/snap/firefox/current/usr/lib/firefox/firefox", "/usr/bin/firefox",
+                 "/usr/lib/firefox/firefox"]
+    import shutil
+    return any(os.path.exists(c) for c in cands) or bool(shutil.which("firefox"))
+
+
+def run_setup():
+    """`--setup`: check/install everything up front and report."""
+    print("\033[1m── Setup check ──\033[0m")
+    print("Python packages: OK (the app is running, so imports succeeded)")
+    sf = ensure_stockfish()
+    print(f"Stockfish:   {sf or 'NOT installed'}")
+    gd = ensure_geckodriver()
+    print(f"geckodriver: {gd or 'NOT installed'}")
+    if _firefox_present():
+        print("Firefox:     found")
+    else:
+        print("Firefox:     \033[93mnot found\033[0m — install it from https://www.mozilla.org/firefox/ "
+              "(a browser is too heavy to auto-install).")
+    print("\033[1m── done ──\033[0m")
+
+
 def initialize_stockfish():
     """Find and initialize the Stockfish chess engine."""
 
@@ -1214,7 +1511,7 @@ def initialize_stockfish():
                     continue
         return None
 
-    stockfish_path = find_stockfish_exe()
+    stockfish_path = find_stockfish_exe() or ensure_stockfish()
     if stockfish_path:
         print(f"Found Stockfish at: {stockfish_path}")
         try:
@@ -1792,6 +2089,8 @@ class SeleniumController:
         gecko = next((p for p in gecko_candidates if os.path.exists(p)), None)
         if gecko is None:
             gecko = shutil.which("geckodriver")
+        if gecko is None:
+            gecko = ensure_geckodriver()   # offer the official download if still missing
         if gecko:
             service = Service(executable_path=gecko)
         else:
@@ -3946,6 +4245,10 @@ if __name__ == "__main__":
 
     import sys
     print("\033[1m═══ Chess.com Assistant ═══\033[0m\n")
+
+    if '--setup' in sys.argv:
+        run_setup()
+        sys.exit(0)
 
     # Notify (only) if a newer, signature-verified version is on GitHub
     try:
