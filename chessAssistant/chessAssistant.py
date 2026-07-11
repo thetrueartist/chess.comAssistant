@@ -3684,8 +3684,12 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                                 print(f"\033[93m  ⚠ VERDICT: SUSPICIOUS (avg CPL {avg:.0f}, {best_pct:.0f}% best)\033[0m")
                             elif avg < 40:
                                 print(f"\033[90m  VERDICT: Strong player (avg CPL {avg:.0f})\033[0m")
+                            elif avg < 70:
+                                print(f"\033[90m  VERDICT: Club-level player (avg CPL {avg:.0f})\033[0m")
+                            elif avg < 110:
+                                print(f"\033[90m  VERDICT: Casual player (avg CPL {avg:.0f})\033[0m")
                             else:
-                                print(f"\033[92m  VERDICT: Human-level (avg CPL {avg:.0f})\033[0m")
+                                print(f"\033[90m  VERDICT: Beginner — lots of blunders (avg CPL {avg:.0f})\033[0m")
                     maybe_report_opponent(game, selenium_controller)
                     print(f"\033[90m  ──────────────────────────\033[0m")
                     if stats['games'] > 0:
@@ -4238,9 +4242,12 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                         elif avg < 40:
                             print(f"\033[90m  VERDICT: Strong player, likely clean "
                                   f"(avg CPL {avg:.0f})\033[0m")
+                        elif avg < 70:
+                            print(f"\033[90m  VERDICT: Club-level player (avg CPL {avg:.0f})\033[0m")
+                        elif avg < 110:
+                            print(f"\033[90m  VERDICT: Casual player (avg CPL {avg:.0f})\033[0m")
                         else:
-                            print(f"\033[92m  VERDICT: Human-level play "
-                                  f"(avg CPL {avg:.0f})\033[0m")
+                            print(f"\033[90m  VERDICT: Beginner — lots of blunders (avg CPL {avg:.0f})\033[0m")
                     else:
                         print(f"\033[90m  VERDICT: Too few moves to judge ({len(cpls)} analyzed)\033[0m")
 
