@@ -529,6 +529,15 @@ class GameState:
             # here, so seed straight from the detection as long as it is a legal position.
             if (self.board.board_fen() == chess.STARTING_BOARD_FEN
                     and new_board.board_fen() != chess.STARTING_BOARD_FEN):
+                # Guard against a 180°-rotated ("flipped") read. When a new game starts as
+                # Black the board flips with an animation; extracting mid-flip yields the
+                # standard start rotated 180° (white men on ranks 7-8, K/Q swapped). That is
+                # a LEGAL position, so the illegality check misses it — but seeding it makes
+                # us play the wrong side and lose (this drove a losing streak). Reject so we
+                # wait for the orientation to settle, then seed the real board.
+                if new_board.board_fen() == "RNBKQBNR/PPPPPPPP/8/8/8/8/pppppppp/rnbkqbnr":
+                    logging.warning("Seed sync rejected: 180°-flipped read (board mid-flip, unsettled)")
+                    return "uncertain"
                 if new_board.status() & _ILLEGAL_STATUS:
                     logging.warning(f"Seed sync rejected: illegal position {fen}")
                     return "uncertain"
