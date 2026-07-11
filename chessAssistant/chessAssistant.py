@@ -3491,6 +3491,20 @@ def _boards_equal(a, b):
         return False
 
 
+def _is_start_position(raw_board):
+    """True if the detected 8x8 board is a fresh chess starting position — the top two
+    and bottom two ranks fully occupied and the middle four ranks empty (32 pieces,
+    either orientation). Seeing this MID-game means a new game has begun (the previous
+    one ended / the opponent abandoned and chess.com swapped the board in place)."""
+    try:
+        top = all(raw_board[0][j] and raw_board[1][j] for j in range(8))
+        bottom = all(raw_board[6][j] and raw_board[7][j] for j in range(8))
+        middle = all(not raw_board[r][j] for r in (2, 3, 4, 5) for j in range(8))
+        return bool(top and bottom and middle)
+    except Exception:
+        return False
+
+
 def _reread_raw_board(board_bounds, piece_templates, playing_color):
     """Capture the screen and extract the current raw 8x8 board (or None on failure).
     Used to confirm our auto-move actually registered on the real board before we
@@ -3851,6 +3865,23 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
             if piece_count > 34 or piece_count < 2:
                 logging.info(f"Skipping frame: invalid piece count {piece_count}")
                 time.sleep(1)
+                continue
+
+            # New-game detection: if we're mid-game but the board is a fresh starting
+            # position, the previous game ended (e.g. the opponent abandoned) and a new
+            # one has begun — chess.com swaps the board in place, so game-over never
+            # fired and we'd otherwise get stuck rejecting the 32-piece board forever.
+            # Reset and re-detect the new game.
+            if (game is not None and game.move_history
+                    and _is_start_position(current_board)):
+                logging.info("Fresh starting position mid-game — new game began; resetting")
+                print("\033[92m  New game detected — switching to it.\033[0m")
+                game = None
+                playing_color = None
+                board_bounds = None
+                board_bounds_screen = None
+                detection_failures = 0
+                uncertain_count = 0
                 continue
 
             # Update game state — use color-only matching if in that mode
