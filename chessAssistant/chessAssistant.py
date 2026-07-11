@@ -3521,6 +3521,32 @@ def _reread_raw_board(board_bounds, piece_templates, playing_color):
         return None
 
 
+def _opponent_verdict(avg, best_pct):
+    """Classify the opponent from average centipawn loss (+ best-move %). Returns
+    (text, ansi_colour). The two engine-suspicion tiers depend on best%; the rest is a
+    play-strength ladder with a rough rating ballpark (CPL→rating is only approximate —
+    it drifts with time control and how forcing the game was)."""
+    if avg < 15 and best_pct > 70:
+        return f"⚠ LIKELY ENGINE — inhuman accuracy (avg CPL {avg:.0f}, {best_pct:.0f}% best)", "91"
+    if avg < 25 and best_pct > 50:
+        return f"⚠ SUSPICIOUS — very engine-like (avg CPL {avg:.0f}, {best_pct:.0f}% best)", "93"
+    ladder = [
+        (12,  "Near-flawless — master strength",      "~2200+"),
+        (20,  "Expert level — very sharp",            "~2000"),
+        (30,  "Strong club player",                   "~1800"),
+        (42,  "Solid club player",                    "~1600"),
+        (55,  "Decent intermediate",                  "~1400"),
+        (70,  "Improving casual player",              "~1200"),
+        (95,  "Casual player — the odd blunder",      "~1000"),
+        (130, "Beginner — blunders regularly",        "~800"),
+        (175, "Novice — hangs stuff often",           "~600"),
+    ]
+    for thresh, label, rating in ladder:
+        if avg < thresh:
+            return f"{label} (avg CPL {avg:.0f}, est. {rating})", "90"
+    return f"Barely playing — drops pieces every few moves (avg CPL {avg:.0f}, est. <500)", "90"
+
+
 def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                        game_mode=None, marathon=False, time_control=None,
                        auto_report=False):
@@ -3678,18 +3704,8 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                         print(f"\033[90m  Opponent: avg CPL={avg:.0f}, best={best_pct:.0f}%, excellent={excellent_pct:.0f}%\033[0m")
                         print(f"\033[90m  Opponent: {inaccuracies} inaccuracies, {mistakes} mistakes, {blunders} blunders (worst={worst} CPL)\033[0m")
                         if len(cpls) >= 8:
-                            if avg < 15 and best_pct > 70:
-                                print(f"\033[91m  ⚠ VERDICT: LIKELY ENGINE (avg CPL {avg:.0f}, {best_pct:.0f}% best)\033[0m")
-                            elif avg < 25 and best_pct > 50:
-                                print(f"\033[93m  ⚠ VERDICT: SUSPICIOUS (avg CPL {avg:.0f}, {best_pct:.0f}% best)\033[0m")
-                            elif avg < 40:
-                                print(f"\033[90m  VERDICT: Strong player (avg CPL {avg:.0f})\033[0m")
-                            elif avg < 70:
-                                print(f"\033[90m  VERDICT: Club-level player (avg CPL {avg:.0f})\033[0m")
-                            elif avg < 110:
-                                print(f"\033[90m  VERDICT: Casual player (avg CPL {avg:.0f})\033[0m")
-                            else:
-                                print(f"\033[90m  VERDICT: Beginner — lots of blunders (avg CPL {avg:.0f})\033[0m")
+                            _v, _c = _opponent_verdict(avg, best_pct)
+                            print(f"\033[{_c}m  VERDICT: {_v}\033[0m")
                     maybe_report_opponent(game, selenium_controller)
                     print(f"\033[90m  ──────────────────────────\033[0m")
                     if stats['games'] > 0:
@@ -4233,21 +4249,8 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
 
                     # Verdict
                     if len(cpls) >= 8:
-                        if avg < 15 and best_pct > 70:
-                            print(f"\033[91m  ⚠ VERDICT: Opponent is VERY LIKELY using an engine "
-                                  f"(avg CPL {avg:.0f}, {best_pct:.0f}% best moves)\033[0m")
-                        elif avg < 25 and best_pct > 50:
-                            print(f"\033[93m  ⚠ VERDICT: Opponent play is SUSPICIOUS "
-                                  f"(avg CPL {avg:.0f}, {best_pct:.0f}% best moves)\033[0m")
-                        elif avg < 40:
-                            print(f"\033[90m  VERDICT: Strong player, likely clean "
-                                  f"(avg CPL {avg:.0f})\033[0m")
-                        elif avg < 70:
-                            print(f"\033[90m  VERDICT: Club-level player (avg CPL {avg:.0f})\033[0m")
-                        elif avg < 110:
-                            print(f"\033[90m  VERDICT: Casual player (avg CPL {avg:.0f})\033[0m")
-                        else:
-                            print(f"\033[90m  VERDICT: Beginner — lots of blunders (avg CPL {avg:.0f})\033[0m")
+                        _v, _c = _opponent_verdict(avg, best_pct)
+                        print(f"\033[{_c}m  VERDICT: {_v}\033[0m")
                     else:
                         print(f"\033[90m  VERDICT: Too few moves to judge ({len(cpls)} analyzed)\033[0m")
 
