@@ -4046,6 +4046,26 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                     and selenium_controller and selenium_controller.is_alive()
                     and getattr(game, '_no_change_count', 0) >= 2
                     and selenium_controller.whose_turn() == 'us'):
+                # If our replayed moves keep failing to land ("didn't register"), the board
+                # orientation/colour is likely mis-detected — retrying can't fix that, and
+                # because promoting skips the no_change branch it would also STARVE the
+                # stall-escape re-detect and just flag our clock on futile retries (this is
+                # what threw game #1 after redeploy). After a few failures, drop to a full
+                # re-detect (which re-detects colour) instead of promoting again. The counter
+                # resets to 0 the moment a move actually registers.
+                game._recovery_attempts = getattr(game, '_recovery_attempts', 0) + 1
+                if game._recovery_attempts > 3:
+                    logging.info("Recovery-play failed repeatedly — re-detecting board+colour from scratch")
+                    print("\033[93m  Can't land our move — re-detecting from scratch...\033[0m")
+                    game._recovery_attempts = 0
+                    game = None
+                    playing_color = None
+                    board_bounds = None
+                    board_bounds_screen = None
+                    detection_failures = 0
+                    uncertain_count = 0
+                    time.sleep(1)
+                    continue
                 logging.info("Recovery-play: our turn but board idle — playing instead of stalling")
                 print("\033[93m  Our move (recovered) — playing...\033[0m")
                 result = "our_turn"
@@ -4289,6 +4309,7 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                                 game.board.push(move)
                                 game.move_history.append(move)
                                 game.is_our_turn = False
+                                game._recovery_attempts = 0   # move landed — clear backoff
                                 # DON'T clear last_raw_board — this prevents phantom piece
                                 # sync. Skip FEN sync for the rest of the game.
                                 game._skip_sync_cycles = 9999
