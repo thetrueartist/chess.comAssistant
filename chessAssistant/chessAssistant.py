@@ -4005,6 +4005,22 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                     # Force a fresh board comparison by marking board as changed
                     game.consecutive_same = 0
                     logging.info("Watchdog: resetting detection counters")
+                    # Stall-escape: if we've been stuck through many watchdog cycles
+                    # (~3 min of no progress — a garbled read we can neither sync nor
+                    # match, not a normal wait), nuke and re-detect board+colour+game
+                    # from scratch rather than stalling until the game abandons.
+                    game._stall_watchdogs = getattr(game, '_stall_watchdogs', 0) + 1
+                    if game._stall_watchdogs >= 6:
+                        logging.info("Stalled too long — re-detecting board + game from scratch")
+                        print("\033[93m  Stalled (can't read the board cleanly) — re-detecting from scratch...\033[0m")
+                        game = None
+                        playing_color = None
+                        board_bounds = None
+                        board_bounds_screen = None
+                        detection_failures = 0
+                        uncertain_count = 0
+                        time.sleep(1)
+                        continue
 
                 # Check for game over every 3 cycles (~2.5s)
                 if selenium_controller and no_change_count % 3 == 0:
@@ -4033,6 +4049,7 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
 
             if game:
                 game._no_change_count = 0
+                game._stall_watchdogs = 0   # real progress — clear the stall counter
 
             uncertain_count = 0
             save_fen(game.fen)
