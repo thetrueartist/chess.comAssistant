@@ -4032,6 +4032,24 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                         _save_bad_read("nomatch", annotated, current_board,
                                        game.fen if game else None)
 
+            # Recovery-play: if we've been re-synced to "our turn" (by the desync guard or a
+            # post-reset seed) but the detected board is unchanged simply because WE haven't
+            # moved yet, nothing below triggers our move — the play path only fires on a
+            # freshly-detected OPPONENT move — so we sit idle and flag our own clock on a
+            # position we already hold (this is what just threw a won +5 game). Promote a
+            # STABLE our-turn read to a play, but only once the DOM clock confirms it really
+            # is our move, so we never move on a bad turn inference. After we move the play
+            # block sets is_our_turn=False, so this won't re-fire (except the move-didn't-land
+            # retry, which is intended).
+            if (result == "no_change" and game and game.is_our_turn
+                    and engine is not None and auto_move and board_bounds_screen
+                    and selenium_controller and selenium_controller.is_alive()
+                    and getattr(game, '_no_change_count', 0) >= 2
+                    and selenium_controller.whose_turn() == 'us'):
+                logging.info("Recovery-play: our turn but board idle — playing instead of stalling")
+                print("\033[93m  Our move (recovered) — playing...\033[0m")
+                result = "our_turn"
+
             if result == "no_change":
                 no_change_count = getattr(game, '_no_change_count', 0) + 1 if game else 0
                 if game:
