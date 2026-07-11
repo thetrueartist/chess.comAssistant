@@ -10,3 +10,4 @@ annotated_chessboard.png
 time_probe_output.txt
 release_signing_key.pem
 *.sqlite
+debug_frames/

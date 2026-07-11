@@ -3525,6 +3525,35 @@ def _is_start_position(raw_board):
         return False
 
 
+_BAD_READ_SAVES = 0
+
+
+def _save_bad_read(tag, annotated, raw_board, fen=None):
+    """Debug: when a board read looks wrong (impossible piece count / can't match /
+    illegal), save the annotated overlay + the detected grid so the exact mis-
+    classification can be inspected. Capped so it can't fill the disk."""
+    global _BAD_READ_SAVES
+    if _BAD_READ_SAVES >= 15:
+        return
+    try:
+        _BAD_READ_SAVES += 1
+        d = os.path.join(SCRIPT_DIR, "debug_frames")
+        os.makedirs(d, exist_ok=True)
+        base = os.path.join(d, f"badread_{_BAD_READ_SAVES:02d}_{tag}")
+        if annotated is not None:
+            cv2.imwrite(base + ".png", annotated)
+        with open(base + ".txt", "w") as f:
+            f.write(f"reason: {tag}\n")
+            if fen:
+                f.write(f"tracked-FEN: {fen}\n")
+            f.write("detected grid (as read, top row first; '.' = empty):\n")
+            for row in raw_board:
+                f.write(" ".join((c or ".") for c in row) + "\n")
+        logging.info(f"Saved bad-read debug frame: {base}.png")
+    except Exception as e:
+        logging.error(f"_save_bad_read failed: {e}")
+
+
 def _reread_raw_board(board_bounds, piece_templates, playing_color):
     """Capture the screen and extract the current raw 8x8 board (or None on failure).
     Used to confirm our auto-move actually registered on the real board before we
@@ -3910,6 +3939,7 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
             # won game like it did before.
             if piece_count > 32 or piece_count < 2:
                 logging.info(f"Skipping frame: invalid piece count {piece_count}")
+                _save_bad_read(f"count{piece_count}", annotated, current_board)
                 invalid_frames += 1
                 if invalid_frames >= 15:
                     logging.info("Persistent invalid board read — re-detecting board + game from scratch")
@@ -3958,6 +3988,10 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                     if color_result != "uncertain":
                         result = color_result
                         logging.info(f"Color-only fallback succeeded: {result}")
+                    else:
+                        # Genuinely couldn't read this frame — grab it for diagnosis.
+                        _save_bad_read("nomatch", annotated, current_board,
+                                       game.fen if game else None)
 
             if result == "no_change":
                 no_change_count = getattr(game, '_no_change_count', 0) + 1 if game else 0
