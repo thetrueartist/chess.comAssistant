@@ -1441,6 +1441,9 @@ def run_setup():
     print("\033[1m── done ──\033[0m")
 
 
+_STOCKFISH_ANNOUNCED = False  # print "Found Stockfish" once, not on every re-init
+
+
 def initialize_stockfish():
     """Find and initialize the Stockfish chess engine."""
 
@@ -1513,7 +1516,10 @@ def initialize_stockfish():
 
     stockfish_path = find_stockfish_exe() or ensure_stockfish()
     if stockfish_path:
-        print(f"Found Stockfish at: {stockfish_path}")
+        global _STOCKFISH_ANNOUNCED
+        if not _STOCKFISH_ANNOUNCED:
+            print(f"Found Stockfish at: {stockfish_path}")
+            _STOCKFISH_ANNOUNCED = True
         try:
             engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
             engine.configure({
@@ -1714,6 +1720,11 @@ def get_best_move(engine, board, piece_count, use_randomizer, skill_level,
     Analyze position and select a move with anti-detection mechanics.
     Uses the python-chess Board directly for accurate position info.
     """
+    # Nothing to analyse once the game is over (checkmate/stalemate): engine.analyse
+    # errors on a terminal board, which used to kick off a noisy engine re-init loop
+    # (the watch-mode "Found Stockfish" spam). Bail cleanly instead.
+    if board.is_game_over():
+        return None, None, None
     for attempt in range(retries):
         try:
             # Adaptive depth with occasional shallow analysis (creates natural errors)
@@ -1867,6 +1878,10 @@ def get_best_move(engine, board, piece_count, use_randomizer, skill_level,
             logging.error(f"Analysis attempt {attempt + 1} failed: {e}")
             if attempt < retries - 1:
                 try:
+                    try:
+                        engine.quit()   # don't leak the dead engine process
+                    except Exception:
+                        pass
                     engine = initialize_stockfish()
                 except Exception:
                     pass
@@ -3573,6 +3588,17 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
             # Check for game over FIRST every cycle (before board detection)
             if selenium_controller and selenium_controller.is_alive() and game is not None:
                 _go, _gt = selenium_controller.detect_game_over()
+                # Abort-at-start / vanished-game guard: if we're in a game but it's no
+                # longer live (an abort drops us back to the lobby with no game-over
+                # modal), treat it as over after a few confirmations so marathon queues a
+                # fresh game instead of the move-retry loop grinding on forever.
+                if not _go and game_mode == "player" and not selenium_controller.is_game_live():
+                    game._not_live = getattr(game, '_not_live', 0) + 1
+                    if game._not_live >= 3:
+                        _go, _gt = True, "Game Aborted"
+                        logging.info("Game no longer live (aborted/ended, no modal) — queuing next game")
+                else:
+                    game._not_live = 0
                 if _go:
                     # Jump directly to game-over handling
                     result_text = _gt
