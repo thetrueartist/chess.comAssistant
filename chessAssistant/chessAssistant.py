@@ -89,6 +89,15 @@ for _noisy in ("urllib3", "urllib3.connectionpool", "selenium",
                "selenium.webdriver.remote.remote_connection"):
     logging.getLogger(_noisy).setLevel(logging.ERROR)
 
+# Detection can misread pieces into a physically-impossible board (two kings, three
+# queens, pawns on the back rank, ...). Syncing to those corrupts the game state and
+# hangs the bot (Stockfish can't analyse a 2-king board → it can't move → flags on
+# time). Both sync paths reject any position carrying one of these structural faults.
+_ILLEGAL_STATUS = (chess.Status.TOO_MANY_KINGS | chess.Status.NO_WHITE_KING
+                   | chess.Status.NO_BLACK_KING | chess.Status.TOO_MANY_WHITE_PIECES
+                   | chess.Status.TOO_MANY_BLACK_PIECES | chess.Status.TOO_MANY_WHITE_PAWNS
+                   | chess.Status.TOO_MANY_BLACK_PAWNS | chess.Status.PAWNS_ON_BACKRANK)
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
@@ -526,6 +535,10 @@ class GameState:
                 # A legal move changes max 4 squares (castling). >6 = detection garbage.
                 logging.warning(f"Sync rejected: {diffs} squares differ (max 6)")
                 rejected = True
+            elif new_board.status() & _ILLEGAL_STATUS:
+                # Physically-impossible board (two kings, three queens, ...) — mis-detection.
+                logging.warning(f"Sync rejected: illegal/mis-detected position {fen}")
+                rejected = True
 
             if not rejected:
                 # Strip phantom pieces (+1 extra)
@@ -597,18 +610,25 @@ class GameState:
         return "uncertain"
 
     def force_sync(self, raw_board):
-        """Force sync the board state from detection (used when tracking is lost)."""
+        """Force sync the board state from detection (used when tracking is lost).
+        REJECTS physically-impossible positions (two kings, three queens, too many
+        pawns, etc.) that come from a mis-detected board — syncing to those corrupts
+        the game state and hangs the bot (Stockfish can't analyse a 2-king board)."""
         fen = self._raw_board_to_fen(raw_board)
         try:
             new_board = chess.Board(fen)
-            self.board = new_board
-            self.last_raw_board = [row[:] for row in raw_board]
-            self.is_our_turn = (self.board.turn == chess.WHITE) == (self.playing_color == "w")
-            logging.info(f"Force synced board: {fen}")
-            return True
         except ValueError as e:
             logging.error(f"Force sync failed: {e}")
             return False
+        # Legality gate: bail on detection garbage (structural king/piece/pawn faults).
+        if new_board.status() & _ILLEGAL_STATUS:
+            logging.warning(f"Force sync rejected: illegal/mis-detected position {fen}")
+            return False
+        self.board = new_board
+        self.last_raw_board = [row[:] for row in raw_board]
+        self.is_our_turn = (self.board.turn == chess.WHITE) == (self.playing_color == "w")
+        logging.info(f"Force synced board: {fen}")
+        return True
 
     def _raw_board_to_fen(self, raw_board):
         """Convert raw 8x8 array to FEN position string with proper metadata."""
@@ -3957,16 +3977,19 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                     else:
                         game._turn_desync = 0
                     if getattr(game, '_turn_desync', 0) >= 4:
-                        logging.info("Active-clock says it's our move but we were waiting — "
-                                     "missed the opponent's move; re-syncing")
-                        print("\033[93m  Missed a move (clock shows it's our turn) — re-syncing...\033[0m")
-                        game.is_our_turn = True
-                        game._skip_sync_cycles = 0
-                        game.force_sync(current_board)
                         game._turn_desync = 0
-                        game._no_change_count = 0
-                        uncertain_count = 0
-                        continue
+                        # Only recover if we can sync to a LEGAL board. If the read is
+                        # garbled (force_sync rejects it), do NOT flip to our-turn or act
+                        # on it — that corrupts the game and is exactly what hung + flagged
+                        # winning games. Leave state and wait for a clean read.
+                        if game.force_sync(current_board):
+                            logging.info("Active-clock says it's our move but we were waiting — re-synced")
+                            print("\033[93m  Missed a move (clock shows it's our turn) — re-syncing...\033[0m")
+                            game.is_our_turn = True
+                            game._skip_sync_cycles = 0
+                            game._no_change_count = 0
+                            uncertain_count = 0
+                            continue
 
                 # Show alive indicator every 10 cycles (~5s)
                 if no_change_count % 10 == 0 and game and not game.is_our_turn:
