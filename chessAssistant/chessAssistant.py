@@ -3567,6 +3567,7 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
     uncertain_count = 0
     max_uncertain = 5
     detection_failures = 0
+    invalid_frames = 0   # consecutive impossible-piece-count reads (phantom); escape hatch
     stats = {'games': 0, 'wins': 0, 'losses': 0, 'draws': 0, 'streak': 0, 'best_streak': 0}
 
     # Check if auto-move is available
@@ -3881,11 +3882,28 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
             )
             cv2.imwrite(os.path.join(SCRIPT_DIR, "annotated_chessboard.png"), annotated)
 
-            # Sanity: skip if piece count is clearly wrong (not a real game)
-            if piece_count > 34 or piece_count < 2:
+            # Sanity: skip if piece count is impossible (>32 can't happen — it's a
+            # phantom read, usually a last-move highlight counted as a piece). If it
+            # PERSISTS, the board region / detection is stuck (force_sync rejects it,
+            # nothing matches, and the desync guard just re-syncs to the same bad
+            # board) — so re-detect everything from scratch rather than freezing on a
+            # won game like it did before.
+            if piece_count > 32 or piece_count < 2:
                 logging.info(f"Skipping frame: invalid piece count {piece_count}")
+                invalid_frames += 1
+                if invalid_frames >= 15:
+                    logging.info("Persistent invalid board read — re-detecting board + game from scratch")
+                    print("\033[93m  Board read stuck (phantom piece) — re-detecting from scratch...\033[0m")
+                    invalid_frames = 0
+                    game = None
+                    playing_color = None
+                    board_bounds = None
+                    board_bounds_screen = None
+                    detection_failures = 0
+                    uncertain_count = 0
                 time.sleep(1)
                 continue
+            invalid_frames = 0   # a valid read — clear the stuck counter
 
             # New-game detection: if we're mid-game but the board is a fresh starting
             # position, the previous game ended (e.g. the opponent abandoned) and a new
