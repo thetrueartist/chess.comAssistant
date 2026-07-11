@@ -3821,6 +3821,33 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                 except Exception:
                     pass
 
+            # Periodically re-verify our colour against the DOM (ground truth). Colour is
+            # detected ONCE at boot, which can lock in the wrong side if the board wasn't
+            # settled yet (game not live / a preview showing the default white-at-bottom
+            # orientation). That poisons the whole game: moves are computed for the wrong
+            # orientation, land on flipped squares, never register, and we flag (this threw
+            # game #1 after redeploy). Board orientation never changes mid-game, so a DOM
+            # colour that disagrees with playing_color means playing_color is wrong — after
+            # two consecutive disagreements, re-detect from scratch to flip it.
+            if (game and playing_color and selenium_controller
+                    and selenium_controller.is_alive() and cycle_count % 8 == 0):
+                dom_c = _detect_color_from_dom(selenium_controller)
+                if dom_c and dom_c != playing_color:
+                    game._color_mismatch = getattr(game, '_color_mismatch', 0) + 1
+                    logging.warning(f"Colour check: playing_color={playing_color} but DOM "
+                                    f"says {dom_c} ({game._color_mismatch}/2)")
+                    if game._color_mismatch >= 2:
+                        print("\033[93m  Wrong colour detected — re-detecting from scratch...\033[0m")
+                        game = None
+                        playing_color = None
+                        board_bounds = None
+                        board_bounds_screen = None
+                        detection_failures = 0
+                        uncertain_count = 0
+                        continue
+                elif dom_c:
+                    game._color_mismatch = 0
+
             # Always capture full screen for reliable detection
             screenshot_path = capture_screenshot(None)
             if not os.path.exists(screenshot_path):
