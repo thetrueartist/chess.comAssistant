@@ -4331,11 +4331,32 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                                 logging.warning(f"Move {move.uci()} didn't register "
                                                 f"(board unchanged) — not committing")
                                 print("\033[93m  Move didn't register (game not live?) — retrying...\033[0m")
+                                # A one-off is a click miss / game-not-live — just retry. But if
+                                # our moves keep clicking into nothing, the INTERNAL board has
+                                # drifted from reality (we're computing moves for pieces that
+                                # aren't there), and retrying the same phantom move never helps —
+                                # it just burns the clock (a bot 'won' a game only because the
+                                # opponent abandoned during 42 such non-registrations). Re-detect
+                                # from scratch so we re-seed the board from what's actually there.
+                                game._noreg_count = getattr(game, '_noreg_count', 0) + 1
+                                if game._noreg_count >= 4:
+                                    logging.warning("Moves not registering repeatedly — internal "
+                                                    "board desynced; re-detecting from scratch")
+                                    print("\033[93m  Moves not landing — re-detecting from scratch...\033[0m")
+                                    game = None
+                                    playing_color = None
+                                    board_bounds = None
+                                    board_bounds_screen = None
+                                    detection_failures = 0
+                                    uncertain_count = 0
+                                    time.sleep(1)
+                                    continue
                                 time.sleep(1.0)
                             else:
                                 game.board.push(move)
                                 game.move_history.append(move)
                                 game.is_our_turn = False
+                                game._noreg_count = 0         # move landed — clear desync counter
                                 game._recovery_attempts = 0   # move landed — clear backoff
                                 # DON'T clear last_raw_board — this prevents phantom piece
                                 # sync. Skip FEN sync for the rest of the game.
