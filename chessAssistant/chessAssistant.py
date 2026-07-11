@@ -520,6 +520,24 @@ class GameState:
             all_sq = set(list(old_map.keys()) + list(new_map.keys()))
             diffs = sum(1 for sq in all_sq if old_map.get(sq) != new_map.get(sq))
 
+            # Fresh-game seed: if our internal board is still the pristine starting
+            # position but the detection clearly isn't, we were just (re)created mid-game
+            # (stall-escape / invalid-read reset at GameState(playing_color)) and have
+            # never synced to reality. The incremental-change guards below assume a valid
+            # prior and would reject the real board forever ("too many pieces lost 32→N",
+            # "diffs > 6"), stalling until the game abandons. There is no trustworthy prior
+            # here, so seed straight from the detection as long as it is a legal position.
+            if (self.board.board_fen() == chess.STARTING_BOARD_FEN
+                    and new_board.board_fen() != chess.STARTING_BOARD_FEN):
+                if new_board.status() & _ILLEGAL_STATUS:
+                    logging.warning(f"Seed sync rejected: illegal position {fen}")
+                    return "uncertain"
+                self.board = new_board
+                self.last_raw_board = [row[:] for row in raw_board]
+                self.is_our_turn = (self.board.turn == chess.WHITE) == (self.playing_color == "w")
+                logging.info(f"Seeded board from detection after reset: {fen}")
+                return "our_turn" if self.is_our_turn else "synced"
+
             # Reject criteria
             rejected = False
             if new_pieces > 32 or new_pieces < 2:
