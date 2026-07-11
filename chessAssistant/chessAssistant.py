@@ -1139,7 +1139,7 @@ def match_piece_in_cell(cell_img, templates, piece_color, cell_size):
         pmap = {"r": "R", "n": "N", "b": "B", "q": "Q", "k": "K", "p": "P"}
     else:
         pmap = {"r": "r", "n": "n", "b": "b", "q": "q", "k": "k", "p": "p"}
-    return pmap.get(best_type, "")
+    return pmap.get(best_type, ""), best_score
 
 
 # ─── Board Extraction ─────────────────────────────────────────────────────────
@@ -1187,7 +1187,25 @@ def extract_board_from_image(full_image, piece_templates, board_bounds, playing_
                 # Use uppercase/lowercase to track color
                 piece = "W" if color == "w" else "B"
             else:
-                piece = match_piece_in_cell(cell_img, piece_templates, color, cell_size)
+                piece, match_score = match_piece_in_cell(cell_img, piece_templates, color, cell_size)
+                # Occupancy gate: an overlay (last-move highlight, game-start "VS" splash,
+                # red check-glow) sitting on an EMPTY square can push classify_cell_color
+                # over its occupancy threshold and invent a phantom piece. Phantoms assemble
+                # into illegal boards (e.g. two kings of one colour) that fail legality and
+                # stall the sync loop. A real piece correlates strongly with its template; an
+                # overlay does not. So if the best template match is very weak, the square is
+                # empty. Threshold sits well below any real piece's score (kept conservative
+                # to never drop a real piece); dropped cells are logged so it can be tuned.
+                min_score = config.get("occupancy_match_min", 0.30)
+                if match_score < min_score:
+                    logging.info(f"Occupancy gate: dropped phantom at r{row}c{col} "
+                                 f"(match={match_score:.3f} < {min_score}, colour={color})")
+                    continue
+                elif match_score < 0.45:
+                    # Marginal keep — logged so the real score distribution (esp. of any
+                    # phantom that squeaks past the gate) is visible for tuning min_score.
+                    logging.info(f"Occupancy gate: marginal keep {piece} at r{row}c{col} "
+                                 f"(match={match_score:.3f})")
 
             if playing_color == "b":
                 r, c = 7 - row, 7 - col
@@ -3939,7 +3957,10 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
             # won game like it did before.
             if piece_count > 32 or piece_count < 2:
                 logging.info(f"Skipping frame: invalid piece count {piece_count}")
-                _save_bad_read(f"count{piece_count}", annotated, current_board)
+                # Only capture a MILD over-count (a mid-game phantom worth diagnosing) —
+                # skip the huge startup VS-splash counts (~40+), which are known/handled.
+                if 32 < piece_count <= 36:
+                    _save_bad_read(f"count{piece_count}", annotated, current_board)
                 invalid_frames += 1
                 if invalid_frames >= 15:
                     logging.info("Persistent invalid board read — re-detecting board + game from scratch")
