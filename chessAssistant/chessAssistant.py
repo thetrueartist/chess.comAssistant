@@ -1941,15 +1941,13 @@ def get_best_move(engine, board, piece_count, use_randomizer, skill_level,
 
         except Exception as e:
             logging.error(f"Analysis attempt {attempt + 1} failed: {e}")
-            if attempt < retries - 1:
-                try:
-                    try:
-                        engine.quit()   # don't leak the dead engine process
-                    except Exception:
-                        pass
-                    engine = initialize_stockfish()
-                except Exception:
-                    pass
+            if _is_engine_dead_error(e):
+                # Engine/subprocess is gone. Re-initialising it into this LOCAL var
+                # wouldn't reach the caller — that local-only respawn was exactly the
+                # bug that hung the whole run. Propagate instead: the main loop owns
+                # `engine` and will respawn it centrally so every analysis site sees
+                # the fresh engine.
+                raise
             time.sleep(0.5)
 
     # Emergency: pick first legal move
@@ -3523,28 +3521,92 @@ def _is_session_dead_error(exc):
     ))
 
 
-def _recover_browser(old_ctrl, game_mode, playing_color, max_attempts=3):
+def _kill_stale_browser():
+    """Kill leftover geckodriver + its marionette Firefox and clear stale temp
+    profiles so a relaunch starts from a clean slate. Targets ONLY the automation
+    browser (matched by --marionette / rust_mozprofile in the cmdline) — never the
+    user's real Firefox, whose profile we import cookies from. Run before each
+    recovery attempt so a torn-down session (e.g. an RDP disconnect that closed
+    everything) doesn't leave zombies/profile-locks that block the next launch."""
+    try:
+        import psutil
+        for p in psutil.process_iter(['name', 'cmdline']):
+            try:
+                name = (p.info.get('name') or '').lower()
+                cmd = ' '.join(p.info.get('cmdline') or []).lower()
+                if 'geckodriver' in name or 'geckodriver' in cmd:
+                    p.kill()
+                elif 'firefox' in name and ('--marionette' in cmd or 'rust_mozprofile' in cmd):
+                    p.kill()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        import glob
+        import shutil as _sh
+        for d in glob.glob('/tmp/rust_mozprofile*'):
+            _sh.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+
+_ENGINE_DEAD_MARKERS = (
+    'engine event loop dead', 'engineterminatederror', 'engine process died',
+    'engine process terminated', 'event loop is closed', 'broken pipe',
+)
+
+
+def _is_engine_dead_error(exc):
+    """True when an exception means the Stockfish engine/subprocess is gone or its
+    async event loop has died — i.e. we must RESPAWN the engine, not keep calling
+    the corpse (calling the corpse is what hung the whole run after a PV-parse
+    storm killed the event loop)."""
+    s = f"{type(exc).__name__} {exc}".lower()
+    return any(k in s for k in _ENGINE_DEAD_MARKERS)
+
+
+def _recover_browser(old_ctrl, game_mode, playing_color, max_attempts=3, persist=False):
     """Tear down a dead/broken Selenium session and bring a fresh one back up,
     reusing the saved chess.com session so we land logged in again. Relaunches
     with a new game so marathon play resumes — the game that was live when the
     browser died is unavoidably forfeited on time and can't be rejoined once it
-    has flagged. Returns a live SeleniumController, or None if it can't recover
-    after max_attempts."""
+    has flagged.
+
+    With persist=True (unattended/marathon) it keeps retrying with backoff until
+    it succeeds or stop_flag is set — so if the browser is down because the display
+    went away (RDP disconnect), the bot simply waits and AUTO-RESUMES the moment the
+    display returns, instead of giving up and hanging at a 'Play again?' prompt.
+    With persist=False it gives up after max_attempts (interactive use). Returns a
+    live SeleniumController, or None (gave up / stopping)."""
     try:
         if old_ctrl:
             old_ctrl.close()
     except Exception:
         pass
-    for attempt in range(1, max_attempts + 1):
+    attempt = 0
+    while not stop_flag.is_set():
+        attempt += 1
+        _kill_stale_browser()   # clear zombies / profile locks from the dead session
         try:
             ctrl = SeleniumController()
             ctrl.launch(game_mode=game_mode, playing_color=playing_color or "w")
             ctrl.ready = True
             return ctrl
         except Exception as e:
-            logging.error(f"Browser relaunch attempt {attempt}/{max_attempts} failed: {e}")
-            print(f"\033[93m  relaunch attempt {attempt}/{max_attempts} failed; retrying...\033[0m")
-            time.sleep(min(4 * attempt, 15))
+            logging.error(f"Browser relaunch attempt {attempt} failed: {e}")
+            if persist:
+                # Unattended: the display may just be gone (RDP disconnected). Keep
+                # waiting so we auto-resume when it comes back.
+                if attempt == 1 or attempt % 5 == 0:
+                    print(f"\033[93m  Browser down (attempt {attempt}) — will keep retrying; "
+                          f"auto-resumes when the display returns.\033[0m")
+                time.sleep(20)
+            else:
+                print(f"\033[93m  relaunch attempt {attempt}/{max_attempts} failed; retrying...\033[0m")
+                if attempt >= max_attempts:
+                    return None
+                time.sleep(min(4 * attempt, 15))
     return None
 
 
@@ -3703,7 +3765,8 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
                 if game is not None and game.move_history:
                     print("\033[93m  (the in-progress game flags on time — starting fresh)\033[0m")
                     logging.info("Browser died mid-game; that game is forfeited on time.")
-                new_ctrl = _recover_browser(selenium_controller, game_mode, playing_color)
+                new_ctrl = _recover_browser(selenium_controller, game_mode, playing_color,
+                                            persist=(marathon or not sys.stdin.isatty()))
                 if new_ctrl is None:
                     print("\033[91mCould not bring the browser back after several tries — stopping.\033[0m")
                     selenium_controller = None
@@ -4512,13 +4575,36 @@ def monitor_chessboard(playing_color, skill_level, use_randomizer, auto_move,
 
         except Exception as e:
             logging.error(f"Error in main loop: {e}")
+            # The Stockfish engine/subprocess died (e.g. a PV-parse storm killed its
+            # async event loop). Respawn it CENTRALLY so `engine` — which every analysis
+            # site uses — points at a live process again, instead of calling the corpse
+            # forever (calling the corpse is what hung the whole run). Loop the re-init so
+            # `engine` is never left as None/dead.
+            if _is_engine_dead_error(e):
+                print("\033[93mStockfish engine died — restarting it...\033[0m")
+                try:
+                    engine.quit()
+                except Exception:
+                    pass
+                engine = None
+                while engine is None and not stop_flag.is_set():
+                    try:
+                        engine = initialize_stockfish()
+                    except Exception as ie:
+                        logging.error(f"Stockfish restart failed: {ie}")
+                        time.sleep(3)
+                if engine is not None:
+                    print("\033[92mStockfish restarted.\033[0m")
+                time.sleep(1)
+                continue
             # Recover if the browser died — either it reads as dead, or the error that
             # just fired is itself a dead-session/connection error from a call that
             # raced the crash (kills the retry-storm-then-hang path).
             if selenium_controller and (not selenium_controller.is_alive()
                                         or _is_session_dead_error(e)):
                 print("\033[91mBrowser crashed — recovering...\033[0m")
-                new_ctrl = _recover_browser(selenium_controller, game_mode, playing_color)
+                new_ctrl = _recover_browser(selenium_controller, game_mode, playing_color,
+                                            persist=(marathon or not sys.stdin.isatty()))
                 if new_ctrl is None:
                     print("\033[91mCould not bring the browser back after several tries — stopping.\033[0m")
                     selenium_controller = None
